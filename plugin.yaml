@@ -1,0 +1,29 @@
+name: telegram-user
+label: Telegram User (MTProto)
+kind: platform
+version: 0.1.0
+description: MTProto user-account bridge for Hermes. Supports .h commands and read-only Telegram history tools without core patches.
+author: community
+requires_env:
+  - name: HERMES_TG_USER_API_ID
+    description: Telegram API ID from my.telegram.org
+    prompt: Telegram API ID
+    password: false
+  - name: HERMES_TG_USER_API_HASH
+    description: Telegram API hash from my.telegram.org
+    prompt: Telegram API hash
+    password: true
+  - name: HERMES_TG_USER_SESSION
+    description: Telethon StringSession for the user account
+    prompt: Telethon StringSession
+    password: true
+optional_env:
+  - name: HERMES_TG_USER_COMMAND
+    description: Command prefix; defaults to .h
+    prompt: Command prefix
+    password: false
+provides_tools:
+  - tg_find_chat
+  - tg_list_topics
+  - tg_read_messages
+  - tg_search_messages
