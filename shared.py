@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
+# The gateway adapter owns this long-lived client. Tool calls intentionally do NOT
+# reuse it: current Hermes may execute async tool handlers on a fresh worker event
+# loop, and Telethon clients must stay on the event loop they were connected on.
 _client = None
 _client_lock = asyncio.Lock()
 
@@ -28,26 +32,53 @@ def credentials() -> tuple[int, str, str]:
     return api_id, api_hash, session
 
 
+def _new_client():
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+    except ImportError as exc:
+        raise RuntimeError("Telethon is not installed: pip install telethon") from exc
+
+    api_id, api_hash, session = credentials()
+    return TelegramClient(StringSession(session), api_id, api_hash)
+
+
+async def _connect_authorized(client):
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise RuntimeError("Telegram StringSession is not authorized")
+    return client
+
+
 async def get_client():
+    """Return the long-lived gateway client bound to the gateway event loop."""
     global _client
     if _client is not None and _client.is_connected():
         return _client
     async with _client_lock:
         if _client is not None and _client.is_connected():
             return _client
-        try:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-        except ImportError as exc:
-            raise RuntimeError("Telethon is not installed: pip install telethon") from exc
-        api_id, api_hash, session = credentials()
-        client = TelegramClient(StringSession(session), api_id, api_hash)
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            raise RuntimeError("Telegram StringSession is not authorized")
-        _client = client
+        _client = await _connect_authorized(_new_client())
         return _client
+
+
+@asynccontextmanager
+async def tool_client() -> AsyncIterator[Any]:
+    """Create a loop-local client for one Hermes tool invocation.
+
+    Hermes' async tool bridge can run each call on a fresh event loop/thread. A
+    Telethon client connected by the gateway cannot safely be awaited there, so
+    read-only tools use a short-lived connection and always disconnect it before
+    Hermes tears the worker loop down.
+    """
+    client = _new_client()
+    try:
+        await _connect_authorized(client)
+        yield client
+    finally:
+        with suppress(Exception):
+            await client.disconnect()
 
 
 async def disconnect_client() -> None:
