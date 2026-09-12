@@ -1,7 +1,7 @@
 name: telegram-user
 label: Telegram User (MTProto)
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: MTProto user-account bridge for Hermes. Supports .h commands and read-only Telegram history tools without core patches.
 author: community
 requires_env:
