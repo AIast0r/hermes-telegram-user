@@ -7,7 +7,6 @@ from typing import Any
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.session import SessionSource
 
 from .shared import disconnect_client, entity_label, get_client
 
@@ -38,6 +37,7 @@ class TelegramUserAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         try:
             from telethon import events
+
             self._client = await get_client()
             self._me = await self._client.get_me()
 
@@ -61,6 +61,7 @@ class TelegramUserAdapter(BasePlatformAdapter):
                 pass
         await disconnect_client()
         self._client = None
+        self._handler = None
         self._mark_disconnected()
 
     async def _on_outgoing(self, event) -> None:
@@ -105,15 +106,16 @@ class TelegramUserAdapter(BasePlatformAdapter):
         elif getattr(chat, "title", None):
             chat_type = "group"
 
-        source = SessionSource(
-            platform=Platform("telegram_user"),
+        # Use Hermes' platform-aware source builder rather than constructing
+        # SessionSource directly. This preserves profile/multiplex routing state.
+        source = self.build_source(
             chat_id=chat_id,
             chat_name=entity_label(chat) if chat is not None else chat_id,
             chat_type=chat_type,
             user_id=str(getattr(self._me, "id", "")),
             user_name=entity_label(self._me),
-            # Deliberately None: one Hermes session per Telegram chat, NOT per topic.
-            thread_id=None,
+            # Deliberately omit thread_id: one Hermes session per Telegram chat,
+            # not one session per forum topic.
             message_id=str(message_id),
         )
         incoming = MessageEvent(
@@ -137,7 +139,7 @@ class TelegramUserAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("Hermes failed to handle .h request")
             try:
-                await self._client.edit_message(int(chat_id), message_id, f"Ошибка Hermes: {exc}")
+                await self._edit_mtproto(chat_id, message_id, f"Ошибка Hermes: {exc}")
             except Exception:
                 pass
             self._pending.pop(chat_id, None)
@@ -198,7 +200,10 @@ class TelegramUserAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id):
         try:
             entity = await self._client.get_entity(int(str(chat_id)))
-            return {"name": entity_label(entity), "type": "group" if getattr(entity, "title", None) else "dm"}
+            return {
+                "name": entity_label(entity),
+                "type": "group" if getattr(entity, "title", None) else "dm",
+            }
         except Exception:
             return {"name": str(chat_id), "type": "dm"}
 
@@ -208,9 +213,14 @@ def check_requirements() -> bool:
         import telethon  # noqa: F401
     except ImportError:
         return False
-    return all((os.getenv(k) or "").strip() for k in (
-        "HERMES_TG_USER_API_ID", "HERMES_TG_USER_API_HASH", "HERMES_TG_USER_SESSION"
-    ))
+    return all(
+        (os.getenv(k) or "").strip()
+        for k in (
+            "HERMES_TG_USER_API_ID",
+            "HERMES_TG_USER_API_HASH",
+            "HERMES_TG_USER_SESSION",
+        )
+    )
 
 
 def validate_config(config) -> bool:
@@ -230,7 +240,11 @@ def register(ctx):
         adapter_factory=lambda cfg: TelegramUserAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
-        required_env=["HERMES_TG_USER_API_ID", "HERMES_TG_USER_API_HASH", "HERMES_TG_USER_SESSION"],
+        required_env=[
+            "HERMES_TG_USER_API_ID",
+            "HERMES_TG_USER_API_HASH",
+            "HERMES_TG_USER_SESSION",
+        ],
         install_hint="pip install telethon",
         env_enablement_fn=_env_enablement,
         max_message_length=4096,
