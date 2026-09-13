@@ -6,6 +6,15 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
+from .telegram_limits import (
+    acquire_gateway_session_lock,
+    configured_flood_sleep_threshold,
+    release_gateway_session_lock,
+    telegram_error_message,
+    tool_gate,
+)
+from .telegram_sanitize import sanitize_name
+
 # The gateway adapter owns this long-lived client. Tool calls intentionally do NOT
 # reuse it: current Hermes may execute async tool handlers on a fresh worker event
 # loop, and Telethon clients must stay on the event loop they were connected on.
@@ -40,7 +49,12 @@ def _new_client():
         raise RuntimeError("Telethon is not installed: pip install telethon") from exc
 
     api_id, api_hash, session = credentials()
-    return TelegramClient(StringSession(session), api_id, api_hash)
+    return TelegramClient(
+        StringSession(session),
+        api_id,
+        api_hash,
+        flood_sleep_threshold=configured_flood_sleep_threshold(),
+    )
 
 
 async def _connect_authorized(client):
@@ -59,26 +73,37 @@ async def get_client():
     async with _client_lock:
         if _client is not None and _client.is_connected():
             return _client
-        _client = await _connect_authorized(_new_client())
-        return _client
+        _, _, session = credentials()
+        acquire_gateway_session_lock(session)
+        try:
+            _client = await _connect_authorized(_new_client())
+            return _client
+        except Exception:
+            release_gateway_session_lock()
+            raise
 
 
 @asynccontextmanager
 async def tool_client() -> AsyncIterator[Any]:
-    """Create a loop-local client for one Hermes tool invocation.
+    """Create one paced, loop-local Telethon client for a Hermes tool call.
 
-    Hermes' async tool bridge can run each call on a fresh event loop/thread. A
-    Telethon client connected by the gateway cannot safely be awaited there, so
-    read-only tools use a short-lived connection and always disconnect it before
-    Hermes tears the worker loop down.
+    The gate bounds concurrent connections and honors any process-wide FloodWait
+    backoff learned from previous Telegram RPCs. The client is always disconnected
+    before Hermes tears down the worker event loop.
     """
-    client = _new_client()
-    try:
-        await _connect_authorized(client)
-        yield client
-    finally:
-        with suppress(Exception):
-            await client.disconnect()
+    async with tool_gate():
+        client = _new_client()
+        try:
+            await _connect_authorized(client)
+            yield client
+        except Exception as exc:
+            message = telegram_error_message(exc)
+            if message != str(exc):
+                raise RuntimeError(message) from exc
+            raise
+        finally:
+            with suppress(Exception):
+                await client.disconnect()
 
 
 async def disconnect_client() -> None:
@@ -88,6 +113,9 @@ async def disconnect_client() -> None:
             await _client.disconnect()
         finally:
             _client = None
+            release_gateway_session_lock()
+    else:
+        release_gateway_session_lock()
 
 
 def utc_iso(value: Optional[datetime]) -> Optional[str]:
@@ -102,5 +130,5 @@ def entity_label(entity: Any) -> str:
     for attr in ("title", "username", "first_name"):
         value = getattr(entity, attr, None)
         if value:
-            return str(value)
-    return str(getattr(entity, "id", "unknown"))
+            return sanitize_name(value, limit=256)
+    return sanitize_name(getattr(entity, "id", "unknown"), limit=256)
