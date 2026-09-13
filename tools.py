@@ -66,8 +66,8 @@ async def _tg_list_topics(args: dict[str, Any], **_: Any) -> str:
     try:
         async with tool_client() as client:
             entity = await resolve_chat(client, chat)
-            from telethon.tl.functions.channels import GetForumTopicsRequest
-            result = await client(GetForumTopicsRequest(channel=entity, offset_date=None, offset_id=0, offset_topic=0, limit=bounded_int(args.get("limit"), 100, 1, 100), q=""))
+            from telethon.tl.functions.messages import GetForumTopicsRequest
+            result = await client(GetForumTopicsRequest(peer=entity, offset_date=None, offset_id=0, offset_topic=0, limit=bounded_int(args.get("limit"), 100, 1, 100), q=""))
             rows = [{"id": int(t.id), "title": getattr(t, "title", ""), "closed": bool(getattr(t, "closed", False)), "hidden": bool(getattr(t, "hidden", False)), "unread": int(getattr(t, "unread_count", 0) or 0), "mentions": int(getattr(t, "unread_mentions_count", 0) or 0), "total_messages": getattr(t, "total_messages", None)} for t in result.topics]
             return _json({"chat": entity_label(entity), "topics": rows})
     except Exception as exc:
