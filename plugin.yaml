@@ -1,8 +1,8 @@
 name: telegram-user
 label: Telegram User (MTProto)
 kind: platform
-version: 0.2.0
-description: MTProto user-account bridge for Hermes. Supports .h commands and read-only Telegram history tools without core patches.
+version: 0.3.0
+description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, media retrieval, contacts and participants. No external MCP required.
 author: community
 requires_env:
   - name: HERMES_TG_USER_API_ID
@@ -22,8 +22,25 @@ optional_env:
     description: Command prefix; defaults to .h
     prompt: Command prefix
     password: false
+  - name: HERMES_TG_USER_REPLY_DEPTH
+    description: Reply-chain depth automatically injected for .h replies; 1-5, default 3
+    prompt: Reply context depth
+    password: false
+  - name: HERMES_TG_USER_MAX_MEDIA_MB
+    description: Maximum Telegram attachment size cached/downloaded by the plugin; default 50 MB
+    prompt: Maximum media MB
+    password: false
 provides_tools:
   - tg_find_chat
   - tg_list_topics
   - tg_read_messages
+  - tg_get_message_context
   - tg_search_messages
+  - tg_search_global
+  - tg_list_folders
+  - tg_get_unread
+  - tg_read_folder
+  - tg_search_media
+  - tg_download_media
+  - tg_contacts
+  - tg_participants
