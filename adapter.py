@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult, utf16_len
 from gateway.platforms.event import MessageEvent, MessageType
 
 from .shared import disconnect_client, entity_label, get_client
+from .telegram_limits import telegram_error_message
 from .telegram_media import cache_message_media, media_info
+from .telegram_sanitize import sanitize_name, sanitize_structure, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -129,19 +131,19 @@ class TelegramUserAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _context_line(message: Any, sender: Any, *, direct: bool) -> str:
-        text = (getattr(message, "message", None) or "").strip()
+        text = sanitize_text(getattr(message, "message", None) or "", limit=3000).strip()
         attachment = media_info(message)
         if not text and attachment:
-            label = attachment.get("kind") or "media"
-            name = attachment.get("file_name")
-            text = f"[{label}{': ' + str(name) if name else ''}]"
+            label = sanitize_name(attachment.get("kind") or "media", limit=64)
+            name = sanitize_name(attachment.get("file_name"), limit=256)
+            text = f"[{label}{': ' + name if name else ''}]"
         if not text:
             text = "[empty message]"
-        # Reply context is useful, but an enormous quoted post should not consume
-        # the whole turn before the user's actual prompt reaches the model.
-        if len(text) > 3000:
-            text = text[:3000] + "…"
-        who = entity_label(sender) if sender is not None else str(getattr(message, "sender_id", "unknown"))
+        who = (
+            sanitize_name(entity_label(sender), limit=256)
+            if sender is not None
+            else sanitize_name(getattr(message, "sender_id", "unknown"), limit=128)
+        )
         prefix = "Reply target" if direct else "Earlier reply"
         return f"{prefix} — {who}: {text}"
 
@@ -196,33 +198,42 @@ class TelegramUserAdapter(BasePlatformAdapter):
             self._context_line(message, sender, direct=index == 0)
             for index, (message, sender) in enumerate(chain_messages)
         ]
-        text = "\n".join(lines)
-        if len(text) > 7000:
-            text = text[:7000] + "…"
+        text = sanitize_text("\n".join(lines), limit=7000) or None
 
         direct_sender = chain_messages[0][1] if chain_messages else None
         author_id = str(getattr(direct, "sender_id", "") or "") or None
-        author_name = entity_label(direct_sender) if direct_sender is not None else None
+        author_name = (
+            sanitize_name(entity_label(direct_sender), limit=256)
+            if direct_sender is not None
+            else None
+        )
         is_own = bool(author_id and str(getattr(self._me, "id", "")) == author_id)
+        chain = [
+            {
+                "id": int(message.id),
+                "sender_id": str(getattr(message, "sender_id", "") or ""),
+                "sender": (
+                    sanitize_name(entity_label(sender), limit=256)
+                    if sender is not None
+                    else None
+                ),
+                "text": sanitize_text(getattr(message, "message", None) or "", limit=1000),
+                "media": media_info(message),
+            }
+            for message, sender in chain_messages
+        ]
         return {
             "message": direct,
-            "text": text or None,
+            "text": text,
             "author_id": author_id,
             "author_name": author_name,
             "is_own": is_own,
-            "chain": [
-                {
-                    "id": int(message.id),
-                    "sender_id": str(getattr(message, "sender_id", "") or ""),
-                    "sender": entity_label(sender) if sender is not None else None,
-                    "text": (getattr(message, "message", None) or "")[:1000],
-                    "media": media_info(message),
-                }
-                for message, sender in chain_messages
-            ],
+            "chain": sanitize_structure(chain, string_limit=2048),
         }
 
-    async def _cache_event_media(self, messages: list[Any]) -> tuple[list[str], list[str], list[dict[str, Any]], MessageType]:
+    async def _cache_event_media(
+        self, messages: list[Any]
+    ) -> tuple[list[str], list[str], list[dict[str, Any]], MessageType]:
         media_urls: list[str] = []
         media_types: list[str] = []
         metadata: list[dict[str, Any]] = []
@@ -246,7 +257,11 @@ class TelegramUserAdapter(BasePlatformAdapter):
                 continue
             kind = str(info.get("kind") or "")
             candidate = _KIND_TO_MESSAGE_TYPE.get(kind)
-            if candidate is not None and _MEDIA_TYPE_PRIORITY.get(candidate, 0) > _MEDIA_TYPE_PRIORITY.get(message_type, 0):
+            if (
+                candidate is not None
+                and _MEDIA_TYPE_PRIORITY.get(candidate, 0)
+                > _MEDIA_TYPE_PRIORITY.get(message_type, 0)
+            ):
                 message_type = candidate
 
             if candidate is None:
@@ -257,20 +272,32 @@ class TelegramUserAdapter(BasePlatformAdapter):
                     self._client, message, max_bytes=self.max_inbound_media_bytes
                 )
                 media_urls.append(str(cached["path"]))
-                media_types.append(str(cached.get("mime_type") or "application/octet-stream"))
+                media_types.append(
+                    str(cached.get("mime_type") or "application/octet-stream")
+                )
                 metadata.append({**cached, "message_id": message_id, "cached": True})
             except Exception as exc:
-                logger.warning("Could not cache Telegram media from message %s: %s", message_id, exc)
+                error = telegram_error_message(exc)
+                logger.warning(
+                    "Could not cache Telegram media from message %s: %s",
+                    message_id,
+                    error,
+                )
                 metadata.append(
                     {
                         **info,
                         "message_id": message_id,
                         "cached": False,
-                        "cache_error": str(exc),
+                        "cache_error": sanitize_text(error, limit=1000),
                     }
                 )
 
-        return media_urls, media_types, metadata, message_type
+        return (
+            media_urls,
+            media_types,
+            sanitize_structure(metadata, string_limit=2048),
+            message_type,
+        )
 
     async def _on_outgoing(self, event) -> None:
         text = (getattr(event.message, "message", None) or "").strip()
@@ -280,7 +307,7 @@ class TelegramUserAdapter(BasePlatformAdapter):
         # Avoid matching `.hello` when the configured command is `.h`.
         if len(text) > len(prefix) and not text[len(prefix)].isspace():
             return
-        prompt = text[len(prefix):].strip()
+        prompt = sanitize_text(text[len(prefix):].strip(), limit=30000)
         if not prompt:
             return
 
@@ -296,8 +323,11 @@ class TelegramUserAdapter(BasePlatformAdapter):
         self._pending[chat_id] = {"message_id": message_id, "peer": input_chat}
         try:
             await event.message.edit(self.thinking_text)
-        except Exception:
-            logger.exception("Failed to edit .h message to thinking state")
+        except Exception as exc:
+            logger.warning(
+                "Failed to edit .h message to thinking state: %s",
+                telegram_error_message(exc),
+            )
 
         try:
             chat = await event.get_chat()
@@ -307,13 +337,17 @@ class TelegramUserAdapter(BasePlatformAdapter):
         reply_header = getattr(event.message, "reply_to", None)
         topic_id = None
         if reply_header is not None:
-            topic_id = getattr(reply_header, "reply_to_top_id", None) or getattr(reply_header, "reply_to_msg_id", None)
+            topic_id = getattr(reply_header, "reply_to_top_id", None) or getattr(
+                reply_header, "reply_to_msg_id", None
+            )
 
         reply_ctx = await self._reply_context(event, input_chat)
         media_sources = [event.message]
         if reply_ctx["message"] is not None:
             media_sources.append(reply_ctx["message"])
-        media_urls, media_types, telegram_media, message_type = await self._cache_event_media(media_sources)
+        media_urls, media_types, telegram_media, message_type = (
+            await self._cache_event_media(media_sources)
+        )
 
         chat_type = "dm"
         if getattr(chat, "broadcast", False):
@@ -325,10 +359,12 @@ class TelegramUserAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=entity_label(chat) if chat is not None else chat_id,
+            chat_name=(
+                sanitize_name(entity_label(chat), limit=256) if chat is not None else chat_id
+            ),
             chat_type=chat_type,
             user_id=str(getattr(self._me, "id", "")),
-            user_name=entity_label(self._me),
+            user_name=sanitize_name(entity_label(self._me), limit=256),
             # Deliberately omit thread_id: one Hermes session per Telegram chat,
             # not one session per forum topic.
             message_id=str(message_id),
@@ -344,7 +380,9 @@ class TelegramUserAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=(
-                str(getattr(reply_ctx["message"], "id", "")) if reply_ctx["message"] is not None else None
+                str(getattr(reply_ctx["message"], "id", ""))
+                if reply_ctx["message"] is not None
+                else None
             ),
             reply_to_text=reply_ctx["text"],
             reply_to_author_id=reply_ctx["author_id"],
@@ -365,20 +403,29 @@ class TelegramUserAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("Hermes failed to handle .h request")
             try:
-                await self._edit_mtproto(chat_id, message_id, f"Ошибка Hermes: {exc}")
+                await self._edit_mtproto(
+                    chat_id,
+                    message_id,
+                    f"Ошибка Hermes: {sanitize_text(exc, limit=1000)}",
+                )
             except Exception:
                 pass
             self._pending.pop(chat_id, None)
 
-    async def _edit_mtproto(self, chat_id: str, message_id: int, content: str) -> SendResult:
+    async def _edit_mtproto(
+        self, chat_id: str, message_id: int, content: str
+    ) -> SendResult:
         try:
             pending = self._pending.get(str(chat_id)) or {}
             peer = pending.get("peer", int(chat_id))
             msg = await self._client.edit_message(peer, int(message_id), content)
-            return SendResult(success=True, message_id=str(getattr(msg, "id", message_id)))
+            return SendResult(
+                success=True, message_id=str(getattr(msg, "id", message_id))
+            )
         except Exception as exc:
-            logger.exception("Telegram MTProto edit failed")
-            return SendResult(success=False, error=str(exc))
+            error = telegram_error_message(exc)
+            logger.warning("Telegram MTProto edit failed: %s", error)
+            return SendResult(success=False, error=error)
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         """Keep the edited `.h` message as the visible transport for one Hermes turn."""
@@ -400,9 +447,11 @@ class TelegramUserAdapter(BasePlatformAdapter):
             msg = await self._client.send_message(int(cid), str(content))
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            return SendResult(success=False, error=telegram_error_message(exc))
 
-    async def edit_message(self, chat_id, message_id, content, finalize=False, metadata=None):
+    async def edit_message(
+        self, chat_id, message_id, content, finalize=False, metadata=None
+    ):
         cid = str(chat_id)
         pending = self._pending.get(cid)
         pending_id = int(pending["message_id"]) if pending else None
@@ -423,11 +472,11 @@ class TelegramUserAdapter(BasePlatformAdapter):
         try:
             entity = await self._client.get_entity(int(str(chat_id)))
             return {
-                "name": entity_label(entity),
+                "name": sanitize_name(entity_label(entity), limit=256),
                 "type": "group" if getattr(entity, "title", None) else "dm",
             }
         except Exception:
-            return {"name": str(chat_id), "type": "dm"}
+            return {"name": sanitize_name(chat_id, limit=128), "type": "dm"}
 
 
 def check_requirements() -> bool:
