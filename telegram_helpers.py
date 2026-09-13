@@ -5,7 +5,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .shared import entity_label, utc_iso
+from .telegram_aliases import aliases_for_peer, get_alias
 from .telegram_media import media_info
+from .telegram_sanitize import sanitize_name, sanitize_structure, sanitize_text
 
 
 def parse_dt(raw: Optional[str]) -> Optional[datetime]:
@@ -33,11 +35,7 @@ def bounded_int(value: Any, default: int, low: int, high: int) -> int:
 
 
 def clean_text(value: Any, *, limit: int = 12000) -> str:
-    text = str(value or "")
-    # JSON already escapes controls, but stripping non-whitespace C0 controls
-    # keeps tool output safe for terminals/loggers too.
-    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
-    return text if len(text) <= limit else text[:limit] + "…"
+    return sanitize_text(value, limit=limit)
 
 
 def person_name(entity: Any) -> str:
@@ -46,46 +44,240 @@ def person_name(entity: Any) -> str:
         for x in (getattr(entity, "first_name", None), getattr(entity, "last_name", None))
         if x
     ]
-    return clean_text(" ".join(parts) or entity_label(entity), limit=256)
+    return sanitize_name(" ".join(parts) or entity_label(entity), limit=256)
+
+
+def peer_id(entity: Any) -> str:
+    if entity is None:
+        return ""
+    try:
+        from telethon import utils
+
+        return str(utils.get_peer_id(entity))
+    except Exception:
+        return str(getattr(entity, "id", "") or "")
+
+
+def _reply_quote(reply: Any) -> Optional[dict[str, Any]]:
+    if reply is None:
+        return None
+    quote = getattr(reply, "quote_text", None)
+    if not quote:
+        return None
+    out: dict[str, Any] = {"text": sanitize_text(quote, limit=2000)}
+    offset = getattr(reply, "quote_offset", None)
+    if offset is not None:
+        try:
+            out["offset"] = int(offset)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _button_texts(message: Any) -> list[str]:
+    out: list[str] = []
+    try:
+        for row in getattr(message, "buttons", None) or []:
+            for button in row:
+                text = sanitize_name(getattr(button, "text", None), limit=256)
+                if text:
+                    out.append(text)
+    except Exception:
+        return []
+    return out[:50]
+
+
+def _hidden_urls(message: Any) -> list[str]:
+    out: list[str] = []
+    for entity in getattr(message, "entities", None) or []:
+        url = getattr(entity, "url", None)
+        if url:
+            clean = sanitize_text(url, limit=2048)
+            if clean and clean not in out:
+                out.append(clean)
+    return out[:50]
+
+
+def _forwarded_info(message: Any) -> Optional[dict[str, Any]]:
+    raw = getattr(message, "fwd_from", None)
+    if raw is None:
+        return None
+    out: dict[str, Any] = {}
+    date = getattr(raw, "date", None)
+    if date is not None:
+        out["date"] = utc_iso(date)
+    from_name = getattr(raw, "from_name", None)
+    if from_name:
+        out["from_name"] = sanitize_name(from_name, limit=256)
+    post_author = getattr(raw, "post_author", None)
+    if post_author:
+        out["post_author"] = sanitize_name(post_author, limit=256)
+    channel_post = getattr(raw, "channel_post", None)
+    if channel_post is not None:
+        try:
+            out["channel_post"] = int(channel_post)
+        except (TypeError, ValueError):
+            pass
+
+    wrapper = getattr(message, "forward", None)
+    if wrapper is not None:
+        origin_chat = getattr(wrapper, "chat", None)
+        if origin_chat is not None:
+            out["from_chat"] = sanitize_name(entity_label(origin_chat), limit=256)
+            origin_username = getattr(origin_chat, "username", None)
+            if origin_username:
+                out["from_username"] = sanitize_name(origin_username, limit=128)
+            origin_id = peer_id(origin_chat)
+            if origin_id:
+                out["from_chat_id"] = origin_id
+        origin_sender = getattr(wrapper, "sender", None)
+        if origin_sender is not None:
+            out["from_user"] = person_name(origin_sender)
+            sender_id = peer_id(origin_sender)
+            if sender_id:
+                out["from_user_id"] = sender_id
+    return out or {"unknown_origin": True}
 
 
 def message_to_dict(message: Any, *, chat: Any = None) -> dict[str, Any]:
     sender = getattr(message, "sender", None)
     reply = getattr(message, "reply_to", None)
+    sender_peer_id = peer_id(sender) or str(getattr(message, "sender_id", "") or "")
     row: dict[str, Any] = {
         "id": int(message.id),
         "date": utc_iso(getattr(message, "date", None)),
-        "sender_id": str(getattr(message, "sender_id", "") or ""),
-        "sender": clean_text(entity_label(sender), limit=256) if sender else None,
-        "text": clean_text(getattr(message, "message", None) or ""),
+        "sender_id": sender_peer_id,
+        "sender": sanitize_name(entity_label(sender), limit=256) if sender else None,
+        "text": sanitize_text(getattr(message, "message", None) or "", limit=12000),
         "out": bool(getattr(message, "out", False)),
         "reply_to_msg_id": getattr(reply, "reply_to_msg_id", None),
         "topic_id": getattr(reply, "reply_to_top_id", None),
     }
+    sender_aliases = aliases_for_peer(sender_peer_id) if sender_peer_id else []
+    if sender_aliases:
+        row["sender_aliases"] = sender_aliases
+
     username = getattr(sender, "username", None) if sender else None
     if username:
-        row["sender_username"] = clean_text(username, limit=128)
+        row["sender_username"] = sanitize_name(username, limit=128)
+
+    quote = _reply_quote(reply)
+    if quote:
+        row["reply_quote"] = quote
+
+    grouped_id = getattr(message, "grouped_id", None)
+    if grouped_id:
+        row["grouped_id"] = str(grouped_id)
+    edit_date = getattr(message, "edit_date", None)
+    if edit_date:
+        row["edited_at"] = utc_iso(edit_date)
+    if bool(getattr(message, "pinned", False)):
+        row["pinned"] = True
+    if bool(getattr(message, "noforwards", False)):
+        row["protected_content"] = True
+
+    for field in ("views", "forwards"):
+        value = getattr(message, field, None)
+        if value is not None:
+            try:
+                row[field] = int(value)
+            except (TypeError, ValueError):
+                pass
+
+    replies = getattr(message, "replies", None)
+    comments = getattr(replies, "replies", None) if replies is not None else None
+    if comments is not None:
+        try:
+            row["comments"] = int(comments)
+        except (TypeError, ValueError):
+            pass
+
+    via_bot_id = getattr(message, "via_bot_id", None)
+    if via_bot_id:
+        row["via_bot_id"] = str(via_bot_id)
+    post_author = getattr(message, "post_author", None)
+    if post_author:
+        row["post_author"] = sanitize_name(post_author, limit=256)
+
+    forwarded = _forwarded_info(message)
+    if forwarded:
+        row["forwarded"] = forwarded
+
+    buttons = _button_texts(message)
+    if buttons:
+        row["buttons"] = buttons
+    urls = _hidden_urls(message)
+    if urls:
+        row["link_urls"] = urls
+
+    action = getattr(message, "action", None)
+    if action is not None:
+        row["service_action"] = type(action).__name__
+
     attachment = media_info(message)
     if attachment:
-        row["media"] = attachment
-    if chat is not None:
-        try:
-            from telethon import utils
+        row["media"] = sanitize_structure(attachment, string_limit=2048)
 
-            row["chat_id"] = str(utils.get_peer_id(chat))
-        except Exception:
-            row["chat_id"] = str(getattr(chat, "id", "") or "")
-        row["chat"] = clean_text(entity_label(chat), limit=256)
+    chat_id = ""
+    if chat is not None:
+        chat_id = peer_id(chat)
+        row["chat_id"] = chat_id
+        row["chat"] = sanitize_name(entity_label(chat), limit=256)
         chat_username = getattr(chat, "username", None)
         if chat_username:
-            row["chat_username"] = clean_text(chat_username, limit=128)
-    return row
+            row["chat_username"] = sanitize_name(chat_username, limit=128)
+        chat_aliases = aliases_for_peer(chat_id) if chat_id else []
+        if chat_aliases:
+            row["chat_aliases"] = chat_aliases
+
+    if attachment and attachment.get("kind") in {"voice", "audio"} and chat_id:
+        try:
+            from .telegram_transcripts import get_cached_transcript
+
+            cached = get_cached_transcript(chat_id, int(message.id))
+        except Exception:
+            cached = None
+        if cached:
+            row["transcript"] = sanitize_text(cached.get("transcript"), limit=30000)
+            row["transcript_cached"] = True
+            if cached.get("provider"):
+                row["transcript_provider"] = sanitize_name(cached["provider"], limit=128)
+            if cached.get("model"):
+                row["transcript_model"] = sanitize_name(cached["model"], limit=128)
+
+    return sanitize_structure(row, string_limit=30000)
 
 
-async def resolve_chat(client: Any, chat: str):
+async def _resolve_alias(client: Any, raw: str):
+    alias = get_alias(raw)
+    if not alias:
+        return None
+    username = str(alias.get("username") or "").strip()
+    if username:
+        try:
+            return await client.get_entity(username)
+        except Exception:
+            pass
+
+    wanted = str(alias.get("peer_id") or "")
+    if not wanted:
+        raise ValueError(f"Telegram alias has no target: {sanitize_name(raw, limit=128)}")
+    async for dialog in client.iter_dialogs():
+        if str(dialog.id) == wanted or peer_id(dialog.entity) == wanted:
+            return dialog.entity
+    raise ValueError(f"Telegram alias target is no longer available: {sanitize_name(raw, limit=128)}")
+
+
+async def resolve_chat(client: Any, chat: str, *, allow_alias: bool = True):
     raw = str(chat).strip()
     if not raw:
         raise ValueError("chat is required")
+
+    if allow_alias:
+        resolved_alias = await _resolve_alias(client, raw)
+        if resolved_alias is not None:
+            return resolved_alias
+
     if raw.lstrip("-").isdigit():
         return await client.get_entity(int(raw))
     try:
@@ -105,8 +297,8 @@ async def resolve_chat(client: Any, chat: str):
         if len(choices) == 1:
             return choices[0]
         if len(choices) > 1:
-            raise ValueError(f"Telegram chat is ambiguous: {chat}")
-        raise ValueError(f"Telegram chat not found: {chat}")
+            raise ValueError(f"Telegram chat is ambiguous: {sanitize_name(chat, limit=128)}")
+        raise ValueError(f"Telegram chat not found: {sanitize_name(chat, limit=128)}")
 
 
 async def find_topic_root(client: Any, entity: Any, topic: str | int):
@@ -128,7 +320,7 @@ async def find_topic_root(client: Any, entity: Any, topic: str | int):
             )
         )
     except Exception as exc:
-        raise ValueError(f"Could not resolve topic {topic!r}") from exc
+        raise ValueError(f"Could not resolve topic {sanitize_name(topic, limit=128)!r}") from exc
     matches = []
     for item in result.topics:
         title = (getattr(item, "title", None) or "").casefold()
@@ -139,8 +331,8 @@ async def find_topic_root(client: Any, entity: Any, topic: str | int):
     if len(matches) == 1:
         return int(matches[0].id)
     if len(matches) > 1:
-        raise ValueError(f"Telegram topic is ambiguous: {topic}")
-    raise ValueError(f"Telegram topic not found: {topic}")
+        raise ValueError(f"Telegram topic is ambiguous: {sanitize_name(topic, limit=128)}")
+    raise ValueError(f"Telegram topic not found: {sanitize_name(topic, limit=128)}")
 
 
 async def message_chat(message: Any):
@@ -173,10 +365,12 @@ def media_filter(kind: str):
     }
     cls_name = names.get(normalized)
     if cls_name is None:
-        raise ValueError(f"unsupported media kind: {kind}")
+        raise ValueError(f"unsupported media kind: {sanitize_name(kind, limit=64)}")
     cls = getattr(types, cls_name, None)
     if cls is None:
-        raise ValueError(f"media filter is unavailable in this Telethon version: {kind}")
+        raise ValueError(
+            f"media filter is unavailable in this Telethon version: {sanitize_name(kind, limit=64)}"
+        )
     return cls()
 
 
