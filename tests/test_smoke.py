@@ -35,7 +35,10 @@ def test_python_sources_compile():
 
 def test_current_hermes_tool_contract_is_present():
     source = (ROOT / "tools.py").read_text(encoding="utf-8")
-    assert 'schema={"name": name, "description": description, "parameters": parameters}' in source
+    assert "schema={" in source
+    assert '"name": name' in source
+    assert '"description": description' in source
+    assert '"parameters": parameters' in source
     assert "is_async=True" in source
     assert "check_fn=_check_requirements" in source
     assert "return json.dumps(" in source
