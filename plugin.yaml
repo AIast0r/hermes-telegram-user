@@ -1,8 +1,8 @@
 name: telegram-user
 label: Telegram User (MTProto)
 kind: platform
-version: 0.3.0
-description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, media retrieval, contacts and participants. No external MCP required.
+version: 0.4.0
+description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, cached voice STT, aliases, rate-limit protection, media retrieval, contacts and participants. No external MCP required.
 author: community
 requires_env:
   - name: HERMES_TG_USER_API_ID
@@ -30,6 +30,22 @@ optional_env:
     description: Maximum Telegram attachment size cached/downloaded by the plugin; default 50 MB
     prompt: Maximum media MB
     password: false
+  - name: HERMES_TG_USER_FLOOD_SLEEP_THRESHOLD
+    description: FloodWait seconds Telethon may sleep internally; default 30, 0 disables silent FloodWait sleep
+    prompt: FloodWait sleep threshold
+    password: false
+  - name: HERMES_TG_USER_MAX_CONCURRENT_TOOLS
+    description: Maximum concurrent Telegram tool clients in this Hermes process; default 3
+    prompt: Telegram tool concurrency
+    password: false
+  - name: HERMES_TG_USER_TOOL_MIN_INTERVAL_MS
+    description: Minimum spacing between Telegram tool-call starts; default 150 ms
+    prompt: Telegram tool spacing ms
+    password: false
+  - name: HERMES_TG_USER_STATE_DIR
+    description: Directory for private alias/transcript state; defaults to ~/.hermes/state/telegram-user
+    prompt: Telegram plugin state directory
+    password: false
 provides_tools:
   - tg_find_chat
   - tg_list_topics
@@ -42,5 +58,9 @@ provides_tools:
   - tg_read_folder
   - tg_search_media
   - tg_download_media
+  - tg_transcribe_voice
   - tg_contacts
   - tg_participants
+  - tg_set_alias
+  - tg_list_aliases
+  - tg_delete_alias
