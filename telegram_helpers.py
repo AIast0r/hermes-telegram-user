@@ -115,11 +115,11 @@ async def find_topic_root(client: Any, entity: Any, topic: str | int):
         return int(raw)
     needle = raw.casefold()
     try:
-        from telethon.tl.functions.channels import GetForumTopicsRequest
+        from telethon.tl.functions.messages import GetForumTopicsRequest
 
         result = await client(
             GetForumTopicsRequest(
-                channel=entity,
+                peer=entity,
                 offset_date=None,
                 offset_id=0,
                 offset_topic=0,
