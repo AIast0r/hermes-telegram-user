@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .shared import entity_label
+from .telegram_aliases import aliases_for_peer
+from .telegram_sanitize import sanitize_name
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,7 @@ async def load_folders(client: Any) -> list[FolderView]:
         if folder_id is None or type(item).__name__ == "DialogFilterDefault":
             continue
         title_obj = getattr(item, "title", "")
-        title = str(getattr(title_obj, "text", title_obj) or "")
+        title = sanitize_name(getattr(title_obj, "text", title_obj) or "", limit=256)
         flags = {
             name: bool(getattr(item, name, False))
             for name in (
@@ -84,8 +86,8 @@ def resolve_folder(folders: list[FolderView], token: str) -> FolderView:
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        raise ValueError(f"Telegram folder is ambiguous: {raw}")
-    raise ValueError(f"Telegram folder not found: {raw}")
+        raise ValueError(f"Telegram folder is ambiguous: {sanitize_name(raw, limit=128)}")
+    raise ValueError(f"Telegram folder not found: {sanitize_name(raw, limit=128)}")
 
 
 def dialog_is_muted(dialog: Any) -> bool:
@@ -158,10 +160,16 @@ def folder_contains(folder: FolderView, dialog: Any) -> bool:
 
 def dialog_summary(dialog: Any) -> dict[str, Any]:
     raw = getattr(dialog, "dialog", None)
+    aliases = aliases_for_peer(str(dialog.id))
     return {
         "id": str(dialog.id),
-        "name": dialog.name or entity_label(dialog.entity),
-        "username": getattr(dialog.entity, "username", None),
+        "name": sanitize_name(dialog.name or entity_label(dialog.entity), limit=256),
+        "aliases": aliases,
+        "username": (
+            sanitize_name(getattr(dialog.entity, "username", None), limit=128)
+            if getattr(dialog.entity, "username", None)
+            else None
+        ),
         "is_group": bool(dialog.is_group),
         "is_channel": bool(dialog.is_channel),
         "is_user": bool(dialog.is_user),
