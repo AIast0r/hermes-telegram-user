@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .telegram_sanitize import sanitize_name, sanitize_text
+
 
 _MIME_FALLBACKS = {
     "photo": "image/jpeg",
@@ -16,7 +18,7 @@ _MIME_FALLBACKS = {
 
 
 def media_info(message: Any) -> Optional[dict[str, Any]]:
-    """Return compact attachment metadata without issuing any Telegram request.
+    """Return compact, sanitized attachment metadata without another Telegram request.
 
     Link previews are deliberately not treated as attachments. Telegram exposes
     preview images through ``message.photo`` too, which otherwise makes a plain
@@ -72,9 +74,12 @@ def media_info(message: Any) -> Optional[dict[str, Any]]:
                 duration = value
                 break
 
-    result: dict[str, Any] = {"kind": kind, "mime_type": str(mime)}
+    result: dict[str, Any] = {
+        "kind": sanitize_name(kind, limit=32),
+        "mime_type": sanitize_text(mime, limit=128),
+    }
     if name:
-        result["file_name"] = str(name)
+        result["file_name"] = sanitize_name(name, limit=512)
     if size is not None:
         try:
             result["size"] = int(size)
