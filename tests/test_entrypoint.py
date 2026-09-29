@@ -125,6 +125,24 @@ def test_the_entry_point_registers_every_tool_and_the_platform():
         assert ctx.platforms[0]["max_message_length"] == 4096
 
 
+def test_the_platform_inherits_the_telegram_allowlist():
+    """A plugin platform that declares no allowlist env default-denies.
+
+    ``_principal_authorized`` finds no env list to match, falls through to
+    ``GATEWAY_ALLOW_ALL_USERS`` and drops the owner's own ``.h`` as
+    "Unauthorized user" while the bot answers from that same account — which is
+    exactly what happened in production. Sharing the telegram env names is what
+    makes both surfaces admit the same people.
+    """
+    with isolated_state(), _gateway_stubs():
+        ctx = _Ctx()
+        plugin_package().register(ctx)
+
+        platform = ctx.platforms[0]
+        assert platform["allowed_users_env"] == "TELEGRAM_ALLOWED_USERS"
+        assert platform["allow_all_env"] == "TELEGRAM_ALLOW_ALL_USERS"
+
+
 def test_every_published_tool_is_reachable_through_the_entry_point():
     """The manifest's provides_tools is a promise this call has to keep."""
     import re

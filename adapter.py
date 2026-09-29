@@ -516,6 +516,15 @@ def register(ctx):
             "HERMES_TG_USER_API_HASH",
         ],
         install_hint="pip install telethon",
+        # Whoever the `telegram` platform admits, `.h` admits too: the bot's list is
+        # one source of truth, and GATEWAY_ALLOWED_USERS still unions on top of it.
+        # Without this the platform default-denies: a plugin platform that declares
+        # no allowlist env leaves `_principal_authorized` with nothing to match, so
+        # it falls through to GATEWAY_ALLOW_ALL_USERS and the owner's own `.h` is
+        # rejected as "Unauthorized user" while the bot answers from that same
+        # account. Sharing the telegram names is deliberate, not a copy-paste.
+        allowed_users_env="TELEGRAM_ALLOWED_USERS",
+        allow_all_env="TELEGRAM_ALLOW_ALL_USERS",
         env_enablement_fn=_env_enablement,
         max_message_length=4096,
         platform_hint=(
