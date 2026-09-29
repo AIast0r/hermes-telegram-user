@@ -37,6 +37,12 @@ def plugin_module(name: str):
 STATE_MODULES = ("core.state.aliases", "core.state.collections", "core.state.watermarks")
 
 
+def plugin_package():
+    """The plugin package itself, so a test can call its ``register`` entry point."""
+    plugin_module("core")
+    return sys.modules[PLUGIN_PACKAGE]
+
+
 @contextmanager
 def isolated_state():
     """Point the plugin's state directory at a throwaway directory.
