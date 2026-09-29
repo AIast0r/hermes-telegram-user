@@ -3,6 +3,5 @@ __pycache__/
 .venv/
 .env
 *.session
-other/*
-!other/README.md
+other/
 .pytest_cache/
