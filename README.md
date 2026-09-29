@@ -377,7 +377,7 @@ So run the install, then check with `hermes plugins doctor telegram-user`. If th
 
 Repeat it after `hermes update`: that rebuilds Hermes' venv from its own lock and strips anything not in it, so a manually installed package does not survive on its own. Without telethon the plugin still imports and registers — `check_requirements()` returns false, so Hermes simply does not offer the platform or the toolset.
 
-**In the published container there is no venv to write into.** `/opt/hermes` is root-owned and read-only to the runtime user, so the image redirects runtime installs to `/opt/data/lazy-packages` — a directory on the data volume that Hermes appends to `sys.path` at startup. `hermes plugins install --enable` resolves the dependency by itself there, and `hermes plugins doctor telegram-user` shows the same `OK` line either way. That directory is wiped when an image upgrade changes the Python ABI, so after a large update re-run the install to put the dependency back.
+**In the published container there is no venv to write into.** `/opt/hermes` is root-owned and read-only to the runtime user, so the image redirects runtime installs to `/opt/data/lazy-packages` — a directory on the data volume that Hermes appends to `sys.path` at startup. `hermes plugins install --enable` resolves the dependency by itself there. Check with `hermes plugins doctor telegram-user`: it prints `WARN: declared python_dependencies not installed: …` whenever the package is missing, wherever it was expected to live, so the absence of that line means it is importable. That directory is wiped when an image upgrade changes the Python ABI, so after a large update re-run the install to put the dependency back.
 
 Manual installation:
 
