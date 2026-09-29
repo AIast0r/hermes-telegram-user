@@ -114,6 +114,8 @@ def test_dispatch_picks_the_request_that_matches_the_peer_kind():
         "ReadReactionsRequest",
         "ReadHistoryRequest",
     ]
+    for request in rec.requests[:2]:
+        assert request.top_msg_id is None, "a whole-chat ack must not scope to a thread"
     assert isinstance(rec.requests[-1], functions.channels.ReadHistoryRequest)
     assert rec.requests[-1].max_id == 200
 
@@ -149,24 +151,18 @@ def test_dispatch_picks_the_request_that_matches_the_peer_kind():
         )
 
 
-def test_no_request_ever_carries_a_zero_bound():
-    """Telegram reads 0 as 'everything'; the asserted bound must reach the wire."""
+def test_no_request_widens_the_bound_to_telegrams_zero():
+    """The caller's id must reach the wire; Telegram reads 0 as 'everything'.
+
+    The bound assertions live in the dispatch test above, which selects each
+    request by type; this pins the one case that must never be sent at all.
+    """
     readstate = _readstate()
-    if not HAS_TELETHON:
-        # The zero case is refused before any import, so it is still covered.
-        rec = Recorder()
-        try:
-            asyncio.run(readstate.acknowledge_read(rec, object(), up_to=0))
-        except ValueError:
-            return
-        raise AssertionError("up_to=0 must be refused")
-
-    from telethon.tl import types
-
     rec = Recorder()
-    asyncio.run(
-        readstate.acknowledge_read(rec, types.InputPeerUser(user_id=1, access_hash=2), up_to=1)
-    )
-    bounded = [r for r in rec.requests if hasattr(r, "max_id")]
-    assert len(bounded) == 1, "exactly one request carries the history bound"
-    assert bounded[0].max_id == 1
+    for bad in (0, None):
+        try:
+            asyncio.run(readstate.acknowledge_read(rec, object(), up_to=bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"up_to={bad!r} must be refused before any request is built")
+    assert rec.requests == []

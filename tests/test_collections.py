@@ -141,20 +141,21 @@ def test_a_corrupt_file_degrades_to_empty():
 
 
 def test_selection_matches_by_peer_id_not_by_title():
-    """A renamed chat must keep resolving; a title is never the key."""
+    """A renamed chat must keep resolving; a title is never the key.
+
+    The dialog entities here are deliberately unmarkable, which exercises the
+    documented fallback to ``Dialog.id``. That works whether or not telethon is
+    installed — with it, ``get_peer_id`` raises for an opaque object and the
+    module falls back; without it, the import itself fails and it falls back the
+    same way — so the property is pinned in both worlds instead of behind a
+    branch that only asserts an exception.
+    """
     import asyncio
 
     with isolated_state():
         store = _store()
         store.save_collection("C", members=[_row(111, "Old title")])
         collections = plugin_module("core.collections")
-
-        class Dialog:
-            def __init__(self, entity, name, peer_id):
-                self.entity = entity
-                self.name = name
-                self.id = peer_id
-                self.dialog = None
 
         class Client:
             def __init__(self, dialogs):
@@ -166,28 +167,31 @@ def test_selection_matches_by_peer_id_not_by_title():
                 for dialog in self._dialogs:
                     yield dialog
 
+        class Dialog:
+            def __init__(self, peer_id, name):
+                self.entity = type("Opaque", (), {"id": peer_id})()
+                self.id = peer_id
+                self.name = name
+                self.dialog = None
+
+        client = Client([Dialog(111, "Renamed since"), Dialog(999, "Something else")])
+        _, dialogs = asyncio.run(collections.select_dialogs(client, "C"))
+        assert [dialog.name for dialog in dialogs] == ["Renamed since"], (
+            "membership must follow the peer id, not the stored title"
+        )
+        assert client.sweeps == 1, "selection must sweep the dialog list exactly once"
+
+        # And the same property through the real Telethon marking, when available.
         try:
             from telethon.tl import types
-            from telethon import utils
         except ImportError:
-            # Without telethon the module falls back to each dialog's own id, so an
-            # empty sweep is simply an empty selection — never a crash.
-            empty = Client([])
-            _, dialogs = asyncio.run(collections.select_dialogs(empty, "C"))
-            assert dialogs == []
             return
 
-        renamed = types.PeerUser(user_id=111)
-        other = types.PeerUser(user_id=999)
-        client = Client(
-            [
-                Dialog(renamed, "Renamed since", utils.get_peer_id(renamed)),
-                Dialog(other, "Something else", utils.get_peer_id(other)),
-            ]
-        )
-        _, dialogs = asyncio.run(collections.select_dialogs(client, "C"))
-        assert [dialog.name for dialog in dialogs] == ["Renamed since"]
-        assert client.sweeps == 1, "selection must sweep the dialog list exactly once"
+        real = Client([Dialog(111, "Renamed"), Dialog(999, "Elsewhere")])
+        real._dialogs[0].entity = types.PeerUser(user_id=111)
+        real._dialogs[1].entity = types.PeerUser(user_id=999)
+        _, dialogs = asyncio.run(collections.select_dialogs(real, "C"))
+        assert [dialog.name for dialog in dialogs] == ["Renamed"]
 
 
 def test_an_unknown_collection_is_refused():
