@@ -612,3 +612,50 @@ def test_list_topics_answers_for_a_chat_that_is_not_a_forum():
     assert payload["topics"] == []
     assert "private chat" in payload["error"]
     assert tools._is_forum(_NotAForum()) is False
+
+
+def test_an_ambiguous_chat_names_the_matches_it_found():
+    """``ambiguous`` alone is an instruction to guess again.
+
+    In production the model asked for a chat by name, got
+    ``{"error": "Telegram chat is ambiguous: тест"}`` after a 29-second scan, and
+    had nothing to choose between — so it retried with another name. Naming the
+    matches is what makes the error actionable.
+    """
+    helpers = plugin_module("core.helpers")
+
+    class _Entity:
+        def __init__(self, ident: int) -> None:
+            self.id = ident
+            self.username = None
+
+    class _Dialog:
+        def __init__(self, name: str, ident: int) -> None:
+            self.name = name
+            self.entity = _Entity(ident)
+
+    class _Client:
+        async def get_entity(self, _raw: Any) -> Any:
+            raise ValueError("not a username")
+
+        def iter_dialogs(self) -> Any:
+            # Exact matches win over partial ones, so ambiguity needs two of them.
+            dialogs = [_Dialog("тест", 111), _Dialog("тест", 222)]
+
+            async def _generate():
+                for dialog in dialogs:
+                    yield dialog
+
+            return _generate()
+
+    with isolated_state():
+        try:
+            _run(helpers.resolve_chat(_Client(), "тест", allow_alias=False))
+        except ValueError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("two matches must be reported as ambiguous")
+
+    assert "matches 2" in message
+    assert "id 111" in message and "id 222" in message
+    assert "will not resolve it" in message

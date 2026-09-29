@@ -9,6 +9,30 @@ from .state.aliases import aliases_for_peer, get_alias
 from .media import media_info
 from .sanitize import sanitize_name, sanitize_structure, sanitize_text
 
+#: How many matches an ambiguity error names before summarising the rest. Without
+#: the list, the caller learns only that its query was wrong — so it guesses again,
+#: and again: the turn burns on retries that cannot converge on their own.
+_AMBIGUOUS_SHOWN = 8
+
+
+def _candidates(entities: list[Any]) -> str:
+    shown = ", ".join(
+        f"{entity_label(entity)} (id {getattr(entity, 'id', '?')})"
+        for entity in entities[:_AMBIGUOUS_SHOWN]
+    )
+    rest = len(entities) - _AMBIGUOUS_SHOWN
+    return f"{shown} and {rest} more" if rest > 0 else shown
+
+
+def _topic_candidates(topics: list[Any]) -> str:
+    shown = ", ".join(
+        f"{sanitize_name(getattr(topic, 'title', ''), limit=64)} "
+        f"(id {int(getattr(topic, 'id', 0) or 0)})"
+        for topic in topics[:_AMBIGUOUS_SHOWN]
+    )
+    rest = len(topics) - _AMBIGUOUS_SHOWN
+    return f"{shown} and {rest} more" if rest > 0 else shown
+
 
 def parse_dt(raw: Optional[str]) -> Optional[datetime]:
     if not raw:
@@ -297,7 +321,11 @@ async def resolve_chat(client: Any, chat: str, *, allow_alias: bool = True):
         if len(choices) == 1:
             return choices[0]
         if len(choices) > 1:
-            raise ValueError(f"Telegram chat is ambiguous: {sanitize_name(chat, limit=128)}")
+            raise ValueError(
+                f"Telegram chat is ambiguous: {sanitize_name(chat, limit=128)} matches "
+                f"{len(choices)} — {_candidates(choices)}. Pass the id or the exact username "
+                "to pick one; repeating the name will not resolve it."
+            )
         raise ValueError(f"Telegram chat not found: {sanitize_name(chat, limit=128)}")
 
 
@@ -331,7 +359,10 @@ async def find_topic_root(client: Any, entity: Any, topic: str | int):
     if len(matches) == 1:
         return int(matches[0].id)
     if len(matches) > 1:
-        raise ValueError(f"Telegram topic is ambiguous: {sanitize_name(topic, limit=128)}")
+        raise ValueError(
+            f"Telegram topic is ambiguous: {sanitize_name(topic, limit=128)} matches "
+            f"{len(matches)} — {_topic_candidates(matches)}. Pass the topic id to pick one."
+        )
     raise ValueError(f"Telegram topic not found: {sanitize_name(topic, limit=128)}")
 
 
