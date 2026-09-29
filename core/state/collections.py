@@ -40,8 +40,10 @@ collection is a save under a new name, not an edit of the old one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import threading
 import unicodedata
 from datetime import datetime, timezone
@@ -58,9 +60,11 @@ __all__ = [
     "list_collections",
     "save_collection",
     "set_collection_brief",
+    "template_path",
 ]
 
 _FILENAME = "collections.json"
+_TEMPLATES_DIRNAME = "templates"
 _VERSION = 1
 #: Long enough for a human label, short enough that a pasted paragraph is not
 #: accepted as one.
@@ -69,9 +73,11 @@ _MAX_NAME_LEN = 128
 #: row carrying one could never match a real dialog. A thread is a message id,
 #: so it lives in the same key space and obeys the same bound.
 _MAX_PEER_ID_LEN = 40
-#: A brief is model-facing prose: long enough for a summary template or an
-#: instruction, short enough that a pasted log is not accepted as one.
-_MAX_BRIEF_LEN = 4000
+#: A brief is a full output template — headings, their order, what each section
+#: holds, the wording of the title — not a one-line hint. It has to be roomy
+#: enough for a real markdown skeleton, and still bounded so a pasted log is not
+#: accepted as one.
+_MAX_BRIEF_LEN = 20000
 
 _LOCK = threading.RLock()
 _CACHE: Optional[dict[str, dict[str, Any]]] = None
@@ -80,6 +86,69 @@ _CACHE: Optional[dict[str, dict[str, Any]]] = None
 def collections_path() -> Path:
     """Where collections live, next to the rest of this plugin's state."""
     return state_dir() / _FILENAME
+
+
+def _slug(key: str) -> str:
+    """A readable, filesystem-safe stem for a collection key.
+
+    ``\\w`` keeps letters and digits in any script, so a Cyrillic name stays
+    readable on disk instead of collapsing to dashes; everything a path cannot
+    carry becomes a dash.
+    """
+    cleaned = re.sub(r"[^\w.-]+", "-", key, flags=re.UNICODE).strip(".-")
+    return cleaned[:_MAX_NAME_LEN] or "collection"
+
+
+def template_path(name: str) -> Optional[Path]:
+    """The markdown template file backing one collection, or ``None`` for a bad name.
+
+    A short digest of the key is appended so two names that slugify identically
+    -- ``a/b`` and ``a-b`` -- cannot share one file, which would silently give
+    them the same template.
+    """
+    key = _key(name)
+    if not key:
+        return None
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
+    return state_dir() / _TEMPLATES_DIRNAME / f"{_slug(key)}-{digest}.md"
+
+
+def _read_template(name: str) -> str:
+    """The stored template, or ``""`` -- a missing or unreadable file is not an error.
+
+    Read on every access rather than cached: the whole point of a file is that
+    its owner can edit it between runs.
+    """
+    path = template_path(name)
+    if path is None or not path.exists():
+        return ""
+    try:
+        return sanitize_text(path.read_text(encoding="utf-8"), limit=_MAX_BRIEF_LEN)
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _write_template(name: str, text: str) -> None:
+    """Replace the template file; ``""`` removes it. Atomic, and private like the rest."""
+    path = template_path(name)
+    if path is None:
+        raise ValueError("collection name is required")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    if not text.strip():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    private_file(tmp)
+    os.replace(tmp, path)
+    private_file(path)
 
 
 def _now() -> str:
@@ -216,24 +285,29 @@ def _stored_row(key: Any, raw: Any) -> Optional[dict[str, Any]]:
     name = sanitize_name(raw.get("name"), limit=_MAX_NAME_LEN) or storage_key
     exclude = _stored_rows(raw.get("exclude"))
     members = _disjoint(_stored_rows(raw.get("members")), exclude)
-    brief = raw.get("brief")
     updated = raw.get("updated_at")
+    # Deliberately no template here: the in-memory cache holds membership only,
+    # and the markdown file is read on every access so an edit made in an editor
+    # takes effect without restarting the process.
     return {
         "name": name,
         "members": members,
         "exclude": exclude,
-        "brief": sanitize_text(brief, limit=_MAX_BRIEF_LEN) if isinstance(brief, str) else "",
         "updated_at": sanitize_name(updated, limit=64) if updated else None,
     }
 
 
-def _public(row: dict[str, Any]) -> dict[str, Any]:
-    """A copy of a collection, safe for a caller to mutate."""
+def _public(key: str, row: dict[str, Any]) -> dict[str, Any]:
+    """A copy of a collection, safe for a caller to mutate.
+
+    The template is read from its file here rather than taken from the cached
+    row, so the file stays the source of truth between runs.
+    """
     return {
         "name": row["name"],
         "members": [dict(item) for item in row["members"]],
         "exclude": [dict(item) for item in row["exclude"]],
-        "brief": row["brief"],
+        "brief": _read_template(key),
         "updated_at": row["updated_at"],
     }
 
@@ -286,10 +360,10 @@ def list_collections() -> list[dict[str, Any]]:
                 "name": row["name"],
                 "member_count": len(row["members"]),
                 "exclude_count": len(row["exclude"]),
-                "has_brief": bool(row["brief"]),
+                "has_brief": bool(_read_template(key)),
                 "updated_at": row["updated_at"],
             }
-            for row in _load_unlocked().values()
+            for key, row in _load_unlocked().items()
         ]
     rows.sort(key=lambda row: str(row.get("name") or "").casefold())
     return rows
@@ -302,7 +376,7 @@ def get_collection(name: str) -> Optional[dict[str, Any]]:
         return None
     with _LOCK:
         row = _load_unlocked().get(key)
-        return _public(row) if row is not None else None
+        return _public(key, row) if row is not None else None
 
 
 def save_collection(
@@ -323,10 +397,10 @@ def save_collection(
     whole-chat exclusion takes every row of that peer, a threaded one only the
     topic it names.
 
-    ``brief`` is free text the caller writes after studying the collection.
-    ``None`` leaves whatever is stored untouched -- including across a
-    ``replace=True`` member overwrite -- an explicit string replaces it, and
-    ``""`` clears it.
+    ``brief`` is the full output template the caller wrote for this collection:
+    the skeleton every later summary follows, so two runs look the same. ``None``
+    leaves whatever is stored untouched -- including across a ``replace=True``
+    member overwrite -- an explicit string replaces it, and ``""`` clears it.
     """
     display = sanitize_name(name, limit=_MAX_NAME_LEN)
     key = _key(display)
@@ -347,20 +421,17 @@ def save_collection(
         else:
             member_rows = _dedupe(incoming_members)
             exclude_rows = _dedupe(incoming_exclude)
-        if incoming_brief is None:
-            brief_text = stored.get("brief", "") if isinstance(stored, dict) else ""
-        else:
-            brief_text = incoming_brief
         row = {
             "name": display,
             "members": _disjoint(member_rows, exclude_rows),
             "exclude": exclude_rows,
-            "brief": brief_text,
             "updated_at": _now(),
         }
         store[key] = row
         _save_unlocked(store)
-    return _public(row)
+        if incoming_brief is not None:
+            _write_template(key, incoming_brief)
+    return _public(key, row)
 
 
 def set_collection_brief(name: str, brief: Any) -> dict[str, Any]:
@@ -381,12 +452,13 @@ def set_collection_brief(name: str, brief: Any) -> dict[str, Any]:
         stored = store.get(key)
         if not isinstance(stored, dict):
             raise ValueError(f"collection not found: {sanitize_name(name, limit=_MAX_NAME_LEN)}")
+        text = sanitize_text(brief, limit=_MAX_BRIEF_LEN)
         row = dict(stored)
-        row["brief"] = sanitize_text(brief, limit=_MAX_BRIEF_LEN)
         row["updated_at"] = _now()
         store[key] = row
         _save_unlocked(store)
-    return _public(row)
+        _write_template(key, text)
+    return _public(key, row)
 
 
 def delete_collection(name: str) -> bool:
@@ -400,4 +472,10 @@ def delete_collection(name: str) -> bool:
         if existed:
             store.pop(key, None)
             _save_unlocked(store)
+            path = template_path(key)
+            if path is not None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
     return existed

@@ -225,15 +225,65 @@ def test_the_brief_can_be_replaced_and_cleared():
         assert store.list_collections()[0]["has_brief"] is False
 
 
-def test_the_brief_is_bounded_and_masked():
+def test_the_template_is_bounded_and_masked():
     with isolated_state():
         store = _store()
-        row = store.save_collection("C", members=[_row(111)], brief="a" * 9000)
+        row = store.save_collection("C", members=[_row(111)], brief="a" * 30000)
         # sanitize_text truncates to the limit and marks it with an ellipsis
         assert row["brief"].endswith("…")
-        assert len(row["brief"]) <= 4001
+        assert len(row["brief"]) <= 20001
         masked = store.save_collection("C", members=[_row(111)], brief="x\u202ey")
         assert masked["brief"] == "xy"
+
+
+def test_the_template_lives_in_its_own_markdown_file():
+    template = "# Саммари\n\n## Решения\n\nОдна строка на решение.\n"
+    with isolated_state() as root:
+        store = _store()
+        store.save_collection("Работа", members=[_row(111)], brief=template)
+
+        path = store.template_path("Работа")
+        assert path is not None
+        assert path.parent == root / "templates"
+        assert path.suffix == ".md"
+        assert path.name.startswith("работа"), "the file stays recognisable by name"
+        assert path.read_text(encoding="utf-8") == template
+
+        # the JSON store keeps membership only — no template text in it
+        raw = json.loads(store.collections_path().read_text(encoding="utf-8"))
+        assert "brief" not in next(iter(raw["collections"].values()))
+        assert "# Саммари" not in store.collections_path().read_text(encoding="utf-8")
+
+
+def test_a_hand_edited_template_is_picked_up_without_a_restart():
+    """The file is the source of truth: editing it in an editor has to be enough."""
+    with isolated_state():
+        store = _store()
+        store.save_collection("C", members=[_row(111)], brief="old")
+        store.template_path("C").write_text("# Новый шаблон\n", encoding="utf-8")
+
+        assert store.get_collection("C")["brief"] == "# Новый шаблон\n"
+        assert store.list_collections()[0]["has_brief"] is True
+
+
+def test_deleting_a_collection_removes_its_template():
+    with isolated_state():
+        store = _store()
+        store.save_collection("C", members=[_row(111)], brief="# t")
+        path = store.template_path("C")
+        assert path.exists()
+        assert store.delete_collection("C") is True
+        assert not path.exists()
+
+
+def test_templates_do_not_collide_when_names_slugify_alike():
+    with isolated_state():
+        store = _store()
+        store.save_collection("a/b", members=[_row(111)], brief="# one")
+        store.save_collection("a-b", members=[_row(222)], brief="# two")
+        assert store.template_path("a/b") != store.template_path("a-b")
+        assert store.get_collection("a/b")["brief"] == "# one"
+        assert store.get_collection("a-b")["brief"] == "# two"
 
 
 def test_writing_the_brief_leaves_members_alone():

@@ -315,7 +315,12 @@ def _faked_unread(tools, scopes):
 
     async def fake_select_scopes(_client, name):
         seen["collection"] = name
-        return {"name": name, "brief": "", "members": []}, list(scopes)
+        stored = plugin_module("core.state.collections").get_collection(name) or {}
+        return {
+            "name": name,
+            "brief": stored.get("brief", ""),
+            "members": stored.get("members") or [],
+        }, list(scopes)
 
     async def fake_read(_client, _entity, *, limit, since=None, until=None, **kwargs):
         seen["fetch"].append(dict(kwargs))

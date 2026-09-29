@@ -179,7 +179,7 @@ An edited message **replaces** its stored row, so the archive is a copy of what 
 Re-listing the same chats every time is noise. A collection is a named local set of chats and/or individual forum threads, with an optional exclude list, that reads can reuse as a scope:
 
 - `tg_save_collection` — save or update one. `chats` takes whole chats; `threads` takes `{"chat": ..., "topic": ...}` entries, so a collection can hold only those threads. `exclude` / `exclude_threads` remove scopes. Anything that did not resolve is reported back instead of being dropped silently.
-- `tg_set_collection_brief` — attach a standing instruction (see below).
+- `tg_set_collection_brief` — store the full output template (see below).
 - `tg_list_collections` — list collections; with a name, show its members, their threads, the brief, and any member that no longer exists in the dialog list.
 - `tg_delete_collection` — delete one.
 - `tg_read_collection` — read a time window across the collection with its exclusions applied, with the same digest bounding as `tg_read_folder`. `tg_get_unread` also takes `collection=`.
@@ -194,9 +194,17 @@ Both readers honour the same scopes: `tg_read_collection` reads a thread member 
 
 Members are stored as Telegram **peer ids** — plus a topic root id for a thread — never titles or usernames: both change, and a renamed chat has to keep resolving.
 
-#### A standing brief per collection
+#### The output template
 
-The plugin supplies data; the summarising is Hermes' job. So a collection can carry a free-text **brief** that the agent gets back with every `tg_read_collection`, instead of retyping its instructions each time.
+The plugin supplies data; the summarising is Hermes' job. So a collection carries a **template** — the markdown skeleton every later summary of that scope follows. Not a one-line hint: the title wording, the headings and their order, and what belongs in each section. That is what makes two runs of the same collection readable side by side instead of differently shaped every time.
+
+It is a real `.md` file, next to the rest of the state:
+
+```text
+<state dir>/templates/<collection>-<hash>.md
+```
+
+so you can open it in an editor and rewrite it — the next read picks the change up, no restart. `tg_read_collection` hands it back as `instructions` together with the messages, and the tool tells the model to follow its structure exactly rather than to merely take it into account.
 
 The workflow that split implies:
 
@@ -204,13 +212,13 @@ The workflow that split implies:
 1. Hermes studies a folder and builds the collection with tg_save_collection
    (threads listed too, when only some topics matter).
 2. Hermes reads it with tg_read_collection — reading only, no summarising — and
-   works out what a good summary of this scope looks like.
-3. Hermes stores that template with tg_set_collection_brief.
-4. From then on tg_read_collection returns the brief with the messages, so
-   "суммаризуй коллекцию Работа" behaves the same way every time.
+   works out what a summary of this scope has to contain.
+3. Hermes stores that skeleton with tg_set_collection_brief.
+4. From then on tg_read_collection returns the template with the messages, so
+   "суммаризуй коллекцию Работа" produces the same shape every time.
 ```
 
-The plugin never calls a model and never summarises. It stores the instruction and hands it back alongside the data, which keeps the summarising model — and the choice of it — on the Hermes side.
+The plugin never calls a model and never summarises. It stores the template and hands it back alongside the data, which keeps the summarising model — and the choice of it — on the Hermes side.
 
 ### Digest watermarks
 
