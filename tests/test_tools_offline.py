@@ -295,7 +295,125 @@ def test_marking_a_thread_uses_the_thread_scope():
         )
 
 
-def test_a_nonsense_position_is_refused():
+@contextlib.contextmanager
+def _faked_unread(tools, scopes):
+    """Replace the Telegram boundary for a collection-scoped unread read."""
+    names = (
+        "tool_client",
+        "select_scopes",
+        "_read_messages",
+        "dialog_summary",
+        "dialog_waiting",
+        "dialog_is_muted",
+    )
+    originals = {name: getattr(tools, name) for name in names}
+    seen = {"fetch": [], "collection": None}
+
+    @contextlib.asynccontextmanager
+    async def fake_tool_client():
+        yield object()
+
+    async def fake_select_scopes(_client, name):
+        seen["collection"] = name
+        return {"name": name, "brief": "", "members": []}, list(scopes)
+
+    async def fake_read(_client, _entity, *, limit, since=None, until=None, **kwargs):
+        seen["fetch"].append(dict(kwargs))
+        return [{"id": 1, "out": False, "text": "hello"}]
+
+    tools.tool_client = fake_tool_client
+    tools.select_scopes = fake_select_scopes
+    tools._read_messages = fake_read
+    tools.dialog_summary = lambda _dialog: {"id": "111", "name": "Forum"}
+    tools.dialog_waiting = lambda _dialog: True
+    tools.dialog_is_muted = lambda _dialog: False
+    try:
+        yield seen
+    finally:
+        for name, value in originals.items():
+            setattr(tools, name, value)
+
+
+class _FakeDialog:
+    """A dialog carrying a chat-wide read pointer, as a real forum dialog does."""
+
+    class _Raw:
+        read_inbox_max_id = 5
+        top_message = 9
+        unread_mark = False
+
+    def __init__(self):
+        self.dialog = self._Raw()
+        self.entity = "ENTITY"
+        self.name = "Forum"
+        self.id = 111
+
+
+def test_unread_of_a_collection_honours_thread_scopes():
+    """The same collection must not mean two different things in two tools.
+
+    tg_read_collection reads a thread member through its own topic. If
+    tg_get_unread fell back to whole-chat dialogs for the same collection it
+    would silently widen the scope, with nothing in the payload to say so.
+    """
+    tools = _tools()
+    with isolated_state():
+        dialog = _FakeDialog()
+        with _faked_unread(tools, [(dialog, None), (dialog, 7)]) as seen:
+            payload = json.loads(_run(tools._tg_get_unread({"collection": "C"})))
+
+        assert seen["collection"] == "C"
+        whole_chat, thread = seen["fetch"][0], seen["fetch"][1]
+
+        assert whole_chat.get("reply_to") is None, "a whole-chat member reads openly"
+        assert whole_chat.get("min_id") == 5, "a chat member is floored at the chat read pointer"
+
+        assert thread["reply_to"] == 7, "a thread member reads within its topic"
+        assert "min_id" not in thread, (
+            "a thread must not be floored by the chat-wide read pointer: that pointer can "
+            "sit above messages the topic never delivered, and the thread would then report "
+            "itself empty while its badge is still lit"
+        )
+
+        assert [entry.get("thread_id") for entry in payload["chats"]] == [None, "7"]
+
+
+def test_unread_of_a_folder_still_reads_whole_dialogs():
+    """The folder path must keep its old shape: no scopes, no thread ids."""
+    tools = _tools()
+    with isolated_state():
+        dialog = _FakeDialog()
+
+        @contextlib.asynccontextmanager
+        async def fake_tool_client():
+            yield object()
+
+        async def fake_select_dialogs(_client, _token):
+            return None, [dialog]
+
+        originals = {n: getattr(tools, n) for n in ("tool_client", "_select_dialogs",
+                                                    "_read_messages", "dialog_summary",
+                                                    "dialog_waiting", "dialog_is_muted")}
+        fetched = []
+        tools.tool_client = fake_tool_client
+        tools._select_dialogs = fake_select_dialogs
+        tools.dialog_summary = lambda _d: {"id": "111"}
+        tools.dialog_waiting = lambda _d: True
+        tools.dialog_is_muted = lambda _d: False
+
+        async def fake_read(_client, _entity, *, limit, since=None, until=None, **kwargs):
+            fetched.append(dict(kwargs))
+            return [{"id": 1, "out": False}]
+
+        tools._read_messages = fake_read
+        try:
+            payload = json.loads(_run(tools._tg_get_unread({})))
+        finally:
+            for name, value in originals.items():
+                setattr(tools, name, value)
+
+        assert fetched[0].get("reply_to") is None
+        assert "thread_id" not in payload["chats"][0]
     tools = _tools()
     with isolated_state():
         with _faked_marking(tools) as seen:

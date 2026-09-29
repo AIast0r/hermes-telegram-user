@@ -57,6 +57,7 @@ __all__ = [
     "get_collection",
     "list_collections",
     "save_collection",
+    "set_collection_brief",
 ]
 
 _FILENAME = "collections.json"

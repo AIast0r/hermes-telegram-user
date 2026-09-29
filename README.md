@@ -176,6 +176,8 @@ Re-listing the same chats every time is noise. A collection is a named local set
 
 Exclusions win: an excluded scope is dropped **from this collection only** — it does not stop the plugin reading that chat directly. Excluding a whole chat also drops that chat's thread entries.
 
+Both readers honour the same scopes: `tg_read_collection` reads a thread member through its own topic and `tg_get_unread` does too, so one collection never means two different things depending on which tool asked.
+
 ```text
 ~/.hermes/state/telegram-user/collections.json
 ```
@@ -422,7 +424,7 @@ python -m pytest tests/ -q
   stored names, the standing brief survives a member overwrite, and resolution is
   by peer id.
 
-87 tests, all offline. `telethon` is optional: when it is importable the
+88 tests, all offline. `telethon` is optional: when it is importable the
 acknowledgement and selection tests assert against the real request classes and
 peer types, and when it is not they assert the documented fallback behaviour
 instead of passing vacuously.
