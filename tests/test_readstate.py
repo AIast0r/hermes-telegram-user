@@ -81,55 +81,92 @@ def test_dispatch_picks_the_request_that_matches_the_peer_kind():
 
     from telethon.tl import functions, types
 
-    # a plain user/chat peer
+    def kinds(reqs):
+        return [type(request).__name__ for request in reqs]
+
+    # a plain user/chat peer: all three badges, then the history bound
     rec = Recorder()
     result = asyncio.run(
         readstate.acknowledge_read(rec, types.InputPeerUser(user_id=1, access_hash=2), up_to=100)
     )
-    assert result == {"scope": "chat", "topic_id": None, "up_to": 100}
-    assert len(rec.requests) == 1
-    request = rec.requests[0]
-    assert type(request).__name__ == "ReadHistoryRequest"
-    assert isinstance(request, functions.messages.ReadHistoryRequest)
-    assert request.max_id == 100
+    assert result["scope"] == "chat"
+    assert result["badges"] == ["unread", "mentions", "reactions"]
+    assert kinds(rec.requests) == [
+        "ReadMentionsRequest",
+        "ReadReactionsRequest",
+        "ReadHistoryRequest",
+    ]
+    assert isinstance(rec.requests[-1], functions.messages.ReadHistoryRequest)
+    assert rec.requests[-1].max_id == 100
+    for request in rec.requests[:2]:
+        assert request.top_msg_id is None, "a whole-chat ack must not scope to a thread"
 
-    # a channel / supergroup
+    # a channel / supergroup takes the channels request for the history part
     rec = Recorder()
     result = asyncio.run(
         readstate.acknowledge_read(
             rec, types.InputPeerChannel(channel_id=3, access_hash=4), up_to=200
         )
     )
-    assert result == {"scope": "channel", "topic_id": None, "up_to": 200}
-    request = rec.requests[0]
-    assert isinstance(request, functions.channels.ReadHistoryRequest)
-    assert request.max_id == 200
+    assert result["scope"] == "channel"
+    assert kinds(rec.requests) == [
+        "ReadMentionsRequest",
+        "ReadReactionsRequest",
+        "ReadHistoryRequest",
+    ]
+    assert isinstance(rec.requests[-1], functions.channels.ReadHistoryRequest)
+    assert rec.requests[-1].max_id == 200
 
-    # one forum thread: readDiscussion, so the other threads keep their badge
+    # one forum thread: readDiscussion plus thread-scoped badge clearing, so the
+    # sibling threads keep their badges
     rec = Recorder()
     result = asyncio.run(
         readstate.acknowledge_read(
             rec, types.InputPeerChannel(channel_id=3, access_hash=4), topic_id=77, up_to=300
         )
     )
-    assert result == {"scope": "topic", "topic_id": 77, "up_to": 300}
-    request = rec.requests[0]
-    assert isinstance(request, functions.messages.ReadDiscussionRequest)
-    assert request.msg_id == 77
-    assert request.read_max_id == 300
-    assert not isinstance(request, functions.channels.ReadHistoryRequest), (
-        "a thread must never be acknowledged with the whole-chat request"
-    )
+    assert result == {
+        "scope": "topic",
+        "topic_id": 77,
+        "up_to": 300,
+        "badges": ["unread", "mentions", "reactions"],
+    }
+    assert kinds(rec.requests) == [
+        "ReadMentionsRequest",
+        "ReadReactionsRequest",
+        "ReadDiscussionRequest",
+    ]
+    for request in rec.requests[:2]:
+        assert request.top_msg_id == 77, "badge clearing must be scoped to the thread"
+    thread_request = rec.requests[-1]
+    assert isinstance(thread_request, functions.messages.ReadDiscussionRequest)
+    assert thread_request.msg_id == 77
+    assert thread_request.read_max_id == 300
+    for request in rec.requests:
+        assert not isinstance(request, functions.channels.ReadHistoryRequest), (
+            "a thread must never be acknowledged with the whole-chat request, "
+            "which would clear every topic in the forum"
+        )
 
 
-def test_the_bound_is_never_widened_to_zero():
-    """Every request carries the caller's id; Telegram's 0 never reaches the wire."""
+def test_no_request_ever_carries_a_zero_bound():
+    """Telegram reads 0 as 'everything'; the asserted bound must reach the wire."""
     readstate = _readstate()
     if not HAS_TELETHON:
-        return
+        # The zero case is refused before any import, so it is still covered.
+        rec = Recorder()
+        try:
+            asyncio.run(readstate.acknowledge_read(rec, object(), up_to=0))
+        except ValueError:
+            return
+        raise AssertionError("up_to=0 must be refused")
 
     from telethon.tl import types
 
     rec = Recorder()
-    asyncio.run(readstate.acknowledge_read(rec, types.InputPeerUser(user_id=1, access_hash=2), up_to=1))
-    assert rec.requests[0].max_id == 1
+    asyncio.run(
+        readstate.acknowledge_read(rec, types.InputPeerUser(user_id=1, access_hash=2), up_to=1)
+    )
+    bounded = [r for r in rec.requests if hasattr(r, "max_id")]
+    assert len(bounded) == 1, "exactly one request carries the history bound"
+    assert bounded[0].max_id == 1

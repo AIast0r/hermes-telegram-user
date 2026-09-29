@@ -4,7 +4,7 @@ A **self-contained Hermes platform plugin** for controlling Hermes from your own
 
 No external MCP server is required. The plugin owns its Telegram bridge, read tools, folder/unread logic, media retrieval, voice transcript cache, aliases, sanitization, and Telegram rate-limit protection.
 
-Current plugin version: **0.6.0**.
+Current plugin version: **0.7.0**.
 
 ## Core UX: `.h` inside Telegram
 
@@ -49,7 +49,7 @@ Photos/files/voice notes are placed in Hermes' normal media cache. `MessageType.
 
 ## Telegram tools
 
-Version 0.6.0 exposes **29 tools** under the `telegram_user` toolset.
+Version 0.7.0 exposes **33 tools** under the `telegram_user` toolset.
 
 ### Chats/history/search
 
@@ -164,6 +164,27 @@ Alias operations modify only the plugin's local state. They do not edit Telegram
 
 An edited message **replaces** its stored row, so the archive is a copy of what Telegram holds now, not a log of every version. Nothing is written to Telegram and no read pointer moves.
 
+### Saved chat collections
+
+Re-listing the same chats every time is noise. A collection is a named local set of chats, with an optional exclude list, that reads can reuse as a scope:
+
+- `tg_save_collection` — save or update a collection from chat ids, titles, usernames or aliases. Anything that did not resolve is reported back instead of being dropped silently.
+- `tg_list_collections` — list collections; with a name, show its members and mark any member that no longer exists in the dialog list.
+- `tg_delete_collection` — delete one.
+- `tg_read_collection` — read a time window across a collection with its exclusions applied, with the same digest bounding as `tg_read_folder`. `tg_get_unread` also takes `collection=`.
+- Exclusions win: a chat in both lists is treated as excluded.
+
+```text
+~/.hermes/state/telegram-user/collections.json
+```
+
+Members are stored as Telegram **peer ids**, never titles or usernames — both change, and a renamed chat has to keep resolving. Re-adding a chat or picking up a rename is just `tg_save_collection` again.
+
+```text
+.h суммаризуй коллекцию Работа
+.h что нового в коллекции Доноры
+```
+
 ### Digest watermarks
 
 Watermarks remember how far a chat — or a single forum thread — has already been summarised, so a later digest can ask for what is new only:
@@ -180,7 +201,7 @@ The rules that keep this safe:
 
 - a mark is keyed by Telegram **peer id**, plus a thread id for a forum topic — never by chat name;
 - a mark only ever moves forward, and only `tg_mark_summarized` moves it; reading never does;
-- a mark is set either to the position the last digest read reached, or to an explicit `up_to` — never to "the top of the chat";
+- a mark is set either to its own current recorded value (i.e. "clear the badge for what is already recorded as summarised") or to an explicit `up_to` — never to "the top of the chat";
 - the badge acknowledgement is sent *before* the mark moves, so a refused call changes nothing;
 - the archive and media tools never touch marks.
 
@@ -265,9 +286,10 @@ tg_mark_summarized(chat="Work", topic="Releases", up_to=1234)   # 3
 
 Semantics worth knowing:
 
-- `up_to` defaults to the position the last digest read reached; if nothing was read yet, the tool **refuses** rather than guessing, because guessing would clear a badge for messages nobody summarised;
+- `up_to` defaults to this scope's own recorded position; if the scope has no mark yet, the tool **refuses** rather than guessing, because guessing would clear a badge for messages nobody summarised;
 - the acknowledgement is sent **before** the local mark moves. If Telegram refuses (FloodWait, permissions, network), nothing moves and the next digest returns the same messages — a repeated summary instead of a silent gap;
 - `topic` marks one forum thread without touching the whole-chat position or its sibling threads;
+- Telegram counts **three** badges separately — plain unread, unread mentions and unread reactions — so the marking call clears all three for the same scope. Clearing only the first would leave a mention or reaction badge lit on a message no later digest would re-surface, i.e. unfixable from here;
 - `acknowledge=false` records the position locally and leaves the badge alone.
 
 `HERMES_TG_USER_SESSION` is equivalent to account access and must be treated as a password.
@@ -380,10 +402,13 @@ python -m pytest tests/ -q
 - `tests/test_tools_offline.py` — tool registration, every handler that can
   refuse bad input without touching Telegram, and the marking contract
   (badge and mark move together; a refused acknowledgement moves neither).
+- `tests/test_collections.py` — collection storage and the rules that decide a
+  scope: exclusion wins, a merge keeps stored names, resolution is by peer id.
 
-66 tests, all offline. `telethon` is optional: when it is importable the
-acknowledgement tests assert against the real request classes, and when it is
-not they assert that the module fails loudly instead of silently skipping.
+77 tests, all offline. `telethon` is optional: when it is importable the
+acknowledgement and selection tests assert against the real request classes and
+peer types, and when it is not they assert the documented fallback behaviour
+instead of passing vacuously.
 
 `pytest` is not listed in `requirements.txt`; install it separately.
 

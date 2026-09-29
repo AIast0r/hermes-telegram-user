@@ -10,6 +10,7 @@ Covers three things worth pinning:
 
 import asyncio
 import contextlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _plugin_support import isolated_state, plugin_module  # noqa: E402
 
 EXPECTED_TOOLSET = "telegram_user"
-EXPECTED_TOOL_COUNT = 29
+EXPECTED_TOOL_COUNT = 33
 
 # handler name -> substring the structured error must contain
 GUARDED_HANDLERS = {
@@ -43,6 +44,9 @@ GUARDED_HANDLERS = {
     "_tg_archive_search": "at least one of chat or query is required",
     "_tg_search_media": "global media search requires kind or query",
     "_tg_mark_summarized": "chat is required",
+    "_tg_save_collection": "name is required",
+    "_tg_delete_collection": "name is required",
+    "_tg_read_collection": "collection is required",
 }
 
 # handlers that answer from local state only
@@ -51,6 +55,7 @@ LOCAL_HANDLERS = (
     "_tg_list_digest_marks",
     "_tg_forget_digest_marks",
     "_tg_archive_status",
+    "_tg_list_collections",
 )
 
 # tools that read Telegram content, so they must carry the injection warning
@@ -68,6 +73,7 @@ CONTENT_TOOLS = (
     "tg_get_profile",
     "tg_archive_sync",
     "tg_archive_search",
+    "tg_read_collection",
 )
 
 PEER = "555"
@@ -104,7 +110,10 @@ def test_registration_contract():
     assert {entry["toolset"] for entry in ctx.tools} == {EXPECTED_TOOLSET}
     assert all(entry["is_async"] for entry in ctx.tools)
     assert all(entry["requires_env"] for entry in ctx.tools)
-    assert all(callable(entry["handler"]) for entry in ctx.tools)
+    for entry in ctx.tools:
+        assert inspect.iscoroutinefunction(entry["handler"]), (
+            f"{entry['name']} is registered with a non-coroutine handler"
+        )
 
     for entry in ctx.tools:
         schema = entry["schema"]
@@ -251,7 +260,7 @@ def test_marking_without_a_position_refuses_to_guess():
     with isolated_state():
         with _faked_marking(tools) as seen:
             payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c"})))
-        assert "no position to mark" in payload["error"]
+        assert "no recorded summary position" in payload["error"]
         assert seen["acks"] == []
         assert marks.get_mark(PEER) is None
 

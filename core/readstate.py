@@ -70,6 +70,15 @@ async def acknowledge_read(
 
     from telethon.tl import functions
 
+    # Telegram counts three badges separately: plain unread, unread mentions and
+    # unread reactions. ReadHistory alone leaves the other two lit, and because
+    # the local mark moves afterwards nothing would ever re-surface that message
+    # — the badge would be unfixable from here. top_msg_id scopes both to the
+    # thread when one is in play, and None means the whole chat.
+    scope = topic if topic is not None else None
+    await client(functions.messages.ReadMentionsRequest(peer=entity, top_msg_id=scope))
+    await client(functions.messages.ReadReactionsRequest(peer=entity, top_msg_id=scope))
+
     if topic is not None:
         # A forum thread is read on its own: readDiscussion targets the topic's
         # root message and leaves the other threads of the chat untouched.
@@ -78,11 +87,26 @@ async def acknowledge_read(
                 peer=entity, msg_id=topic, read_max_id=up_to
             )
         )
-        return {"scope": "topic", "topic_id": topic, "up_to": up_to}
+        return {
+            "scope": "topic",
+            "topic_id": topic,
+            "up_to": up_to,
+            "badges": ["unread", "mentions", "reactions"],
+        }
 
     if _is_channel(entity):
         await client(functions.channels.ReadHistoryRequest(channel=entity, max_id=up_to))
-        return {"scope": "channel", "topic_id": None, "up_to": up_to}
+        return {
+            "scope": "channel",
+            "topic_id": None,
+            "up_to": up_to,
+            "badges": ["unread", "mentions", "reactions"],
+        }
 
     await client(functions.messages.ReadHistoryRequest(peer=entity, max_id=up_to))
-    return {"scope": "chat", "topic_id": None, "up_to": up_to}
+    return {
+        "scope": "chat",
+        "topic_id": None,
+        "up_to": up_to,
+        "badges": ["unread", "mentions", "reactions"],
+    }

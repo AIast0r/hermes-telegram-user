@@ -28,6 +28,7 @@ def test_required_files_exist():
         "tools.py",
         "core/archive.py",
         "core/client.py",
+        "core/collections.py",
         "core/folders.py",
         "core/helpers.py",
         "core/limits.py",
@@ -36,6 +37,7 @@ def test_required_files_exist():
         "core/sanitize.py",
         "core/state/aliases.py",
         "core/state/archive.py",
+        "core/state/collections.py",
         "core/state/paths.py",
         "core/state/transcripts.py",
         "core/state/watermarks.py",
@@ -83,16 +85,23 @@ def test_tool_surface_matches_manifest():
     """plugin.yaml is the published contract; tools.py must register exactly that set."""
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     source = (ROOT / "tools.py").read_text(encoding="utf-8")
-    assert "version: 0.6.0" in manifest
+    assert "version: 0.7.0" in manifest
     published = [
         line.strip()[2:] for line in manifest.splitlines() if line.strip().startswith("- tg_")
     ]
-    assert len(published) == 29
-    assert len(set(published)) == 29
-    registered = set(re.findall(r'^ {8}"(tg_[a-z_]+)",$', source, re.MULTILINE))
+    assert len(published) == 33
+    assert len(set(published)) == 33
+    row_names = re.findall(r'^ {8}"(tg_[a-z_]+)",$', source, re.MULTILINE)
+    registered = set(row_names)
     assert registered == set(published), (
         f"manifest-only: {sorted(set(published) - registered)}; "
         f"code-only: {sorted(registered - set(published))}"
+    )
+    # A name must appear exactly once per row. A stray duplicate means the row is
+    # malformed — e.g. a bare string where the handler belongs, which still read
+    # as the right *set* of names and so slipped past the check above.
+    assert len(row_names) == len(published), (
+        f"{len(row_names)} tool-name lines for {len(published)} tools: a row is malformed"
     )
     for tool in (
         "tg_get_message_context",
@@ -120,6 +129,10 @@ def test_tool_surface_matches_manifest():
         "tg_list_digest_marks",
         "tg_forget_digest_marks",
         "tg_mark_summarized",
+        "tg_save_collection",
+        "tg_list_collections",
+        "tg_delete_collection",
+        "tg_read_collection",
     ):
         assert tool in published
 
@@ -153,7 +166,15 @@ def test_only_one_scoped_tool_may_write_telegram_read_state():
     acknowledging = sorted(
         name
         for name, source in sources.items()
-        if "ReadHistoryRequest(" in source or "ReadDiscussionRequest(" in source
+        if any(
+            marker in source
+            for marker in (
+                "ReadHistoryRequest(",
+                "ReadDiscussionRequest(",
+                "ReadMentionsRequest(",
+                "ReadReactionsRequest(",
+            )
+        )
     )
     assert acknowledging == ["core/readstate.py"], (
         f"read acknowledgement must live in exactly one module: {acknowledging}"

@@ -34,7 +34,7 @@ def plugin_module(name: str):
     return importlib.import_module(f"{PLUGIN_PACKAGE}.{name}")
 
 
-STATE_MODULES = ("core.state.aliases", "core.state.watermarks")
+STATE_MODULES = ("core.state.aliases", "core.state.collections", "core.state.watermarks")
 
 
 @contextmanager

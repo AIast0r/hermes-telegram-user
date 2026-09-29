@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from .core.archive import ARCHIVE_MAX_SYNC, search_archive, sync_chat
 from .core.client import credentials, entity_label, tool_client, utc_iso
+from .core.collections import describe_collection, select_dialogs
 from .core.folders import (
     dialog_is_muted,
     dialog_summary,
@@ -34,6 +35,12 @@ from .core.readstate import acknowledge_read
 from .core.sanitize import sanitize_name, sanitize_structure, sanitize_text
 from .core.state.aliases import delete_alias, list_aliases, set_alias
 from .core.state.archive import archive_path, forget_chat, open_archive, stats
+from .core.state.collections import (
+    delete_collection,
+    get_collection,
+    list_collections,
+    save_collection,
+)
 from .core.state.transcripts import (
     get_cached_transcript,
     save_transcript,
@@ -357,23 +364,42 @@ async def _tg_get_unread(args: dict[str, Any], **_: Any) -> str:
     try:
         since, until = _window(args)
         folder_token = str(args.get("folder") or "").strip()
+        collection_token = str(args.get("collection") or "").strip()
+        if folder_token and collection_token:
+            return _json({"error": "pass either folder or collection, not both"})
         max_chats = bounded_int(args.get("max_chats"), 20, 1, 100)
         per_chat = bounded_int(args.get("messages_per_chat"), 50, 1, 500)
         include_muted = bool(args.get("include_muted", True))
         digest = bool(args.get("since_last_digest", False))
         async with tool_client() as client:
-            folder, dialogs = await _select_dialogs(client, folder_token)
+            collection = None
+            if collection_token:
+                collection, dialogs = await select_dialogs(client, collection_token)
+                folder = None
+            else:
+                folder, dialogs = await _select_dialogs(client, folder_token)
             chats = []
             for dialog in dialogs:
-                if not dialog_waiting(dialog) or (not include_muted and dialog_is_muted(dialog)):
-                    continue
                 raw = getattr(dialog, "dialog", None)
                 read_max = int(getattr(raw, "read_inbox_max_id", 0) or 0)
                 digest_info = None
+                bounds: dict[str, Any] = {}
                 if digest:
-                    # The marker is the authority for "what did I miss": a chat the
-                    # owner already read on their phone is still unsummarised here.
                     _key, bounds, digest_info = _digest_bounds(dialog.entity)
+                # With a digest the marker is the authority, so a chat the owner
+                # already read on their phone still counts as unsummarised; without
+                # one, only genuinely waiting dialogs are interesting.
+                behind_mark = bool(
+                    digest
+                    and digest_info
+                    and int(getattr(raw, "top_message", 0) or 0)
+                    and int(digest_info["mark"]) < int(getattr(raw, "top_message", 0) or 0)
+                )
+                if not dialog_waiting(dialog) and not behind_mark:
+                    continue
+                if not include_muted and dialog_is_muted(dialog):
+                    continue
+                if digest:
                     rows = await _read_messages(
                         client,
                         dialog.entity,
@@ -409,6 +435,7 @@ async def _tg_get_unread(args: dict[str, Any], **_: Any) -> str:
             return _json(
                 {
                     "folder": {"id": folder.id, "title": folder.title} if folder else None,
+                    "collection": collection.get("name") if collection else None,
                     "chat_count": len(chats),
                     "read_receipts_sent": False,
                     "since_last_digest": digest,
@@ -1218,8 +1245,8 @@ async def _tg_mark_summarized(args: dict[str, Any], **_: Any) -> str:
                     return _json(
                         {
                             "error": (
-                                "nothing has been read as a digest for this scope yet, so there "
-                                "is no position to mark; read it first or pass up_to explicitly"
+                                "this scope has no recorded summary position yet, so there is "
+                                "nothing to mark; pass up_to explicitly to state the position"
                             )
                         }
                     )
@@ -1262,6 +1289,145 @@ async def _tg_mark_summarized(args: dict[str, Any], **_: Any) -> str:
         return _error(exc)
 
 
+async def _collection_rows(
+    client: Any, tokens: Any
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve chat tokens to stored rows, reporting the ones that did not resolve."""
+    rows: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    for raw in tokens or []:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        try:
+            entity = await resolve_chat(client, token)
+        except Exception:
+            unresolved.append(sanitize_name(token, limit=128))
+            continue
+        key = peer_id(entity)
+        if not key:
+            unresolved.append(sanitize_name(token, limit=128))
+            continue
+        rows.append(
+            {
+                "peer_id": key,
+                "name": entity_label(entity),
+                "username": getattr(entity, "username", None),
+            }
+        )
+    return rows, unresolved
+
+
+async def _tg_save_collection(args: dict[str, Any], **_: Any) -> str:
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return _json({"error": "name is required"})
+    chats = args.get("chats")
+    exclude = args.get("exclude")
+    chats = [] if chats in (None, "") else chats
+    exclude = [] if exclude in (None, "") else exclude
+    if not isinstance(chats, list) or not isinstance(exclude, list):
+        return _json(
+            {
+                "error": (
+                    "chats and exclude must be lists of chat ids, titles, usernames or aliases"
+                )
+            }
+        )
+    if not chats and not exclude:
+        return _json({"error": "a collection needs at least one chat or exclude entry"})
+    replace = bool(args.get("replace", True))
+    try:
+        async with tool_client() as client:
+            members, unresolved_members = await _collection_rows(client, chats)
+            excluded, unresolved_exclude = await _collection_rows(client, exclude)
+        # Exclusion wins, so the store drops any peer that is in both lists.
+        row = save_collection(name, members=members, exclude=excluded, replace=replace)
+        return _json(
+            {
+                "saved": True,
+                "collection": row,
+                "unresolved_members": unresolved_members,
+                "unresolved_exclude": unresolved_exclude,
+            }
+        )
+    except Exception as exc:
+        return _error(exc)
+
+
+async def _tg_list_collections(args: dict[str, Any], **_: Any) -> str:
+    name = str(args.get("name") or "").strip()
+    try:
+        if not name:
+            rows = list_collections()
+            return _json({"count": len(rows), "collections": rows})
+        async with tool_client() as client:
+            return _json({"collection": await describe_collection(client, name)})
+    except Exception as exc:
+        return _error(exc)
+
+
+async def _tg_delete_collection(args: dict[str, Any], **_: Any) -> str:
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return _json({"error": "name is required"})
+    try:
+        removed = delete_collection(name)
+        return _json({"removed": removed, "name": sanitize_name(name, limit=128)})
+    except Exception as exc:
+        return _error(exc)
+
+
+async def _tg_read_collection(args: dict[str, Any], **_: Any) -> str:
+    name = str(args.get("collection") or "").strip()
+    if not name:
+        return _json({"error": "collection is required"})
+    try:
+        since = parse_dt(args.get("since") or "today")
+        until = parse_dt(args.get("until"))
+        unread_only = bool(args.get("unread_only", False))
+        chat_limit = bounded_int(args.get("chat_limit"), 30, 1, 100)
+        per_chat = bounded_int(args.get("messages_per_chat"), 50, 1, 500)
+        digest = bool(args.get("since_last_digest", False))
+        async with tool_client() as client:
+            collection, dialogs = await select_dialogs(client, name)
+            chats = []
+            for dialog in dialogs:
+                if unread_only and not dialog_waiting(dialog):
+                    continue
+                digest_info = None
+                bounds: dict[str, Any] = {}
+                if digest:
+                    _key, bounds, digest_info = _digest_bounds(dialog.entity)
+                rows = await _read_messages(
+                    client,
+                    dialog.entity,
+                    limit=per_chat,
+                    since=since,
+                    until=until,
+                    **bounds,
+                )
+                if rows:
+                    entry = {**dialog_summary(dialog), "messages": rows}
+                    if digest:
+                        entry["digest"] = digest_info
+                    chats.append(entry)
+                if len(chats) >= chat_limit:
+                    break
+            return _json(
+                {
+                    "collection": collection.get("name"),
+                    "member_count": len(collection.get("members") or []),
+                    "chat_count": len(chats),
+                    "read_receipts_sent": False,
+                    "since_last_digest": digest,
+                    "chats": chats,
+                }
+            )
+    except Exception as exc:
+        return _error(exc)
+
+
 def _obj(properties: dict[str, Any], required: Optional[list[str]] = None) -> dict[str, Any]:
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
@@ -1272,6 +1438,15 @@ def _obj(properties: dict[str, Any], required: Optional[list[str]] = None) -> di
 _CHAT = {
     "type": "string",
     "description": "Chat id, title, username, or exact saved Telegram alias.",
+}
+_COLLECTION = {
+    "type": "string",
+    "description": "Name of a saved local chat collection (see tg_save_collection).",
+}
+_STRINGS = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": "Chat ids, titles, usernames or exact saved aliases.",
 }
 _SINCE = {"type": "string", "description": "ISO datetime, today, or yesterday."}
 _UNTIL = {"type": "string", "description": "Exclusive ISO upper bound."}
@@ -1357,11 +1532,12 @@ _TOOL_DEFS = [
     ),
     (
         "tg_get_unread",
-        f"Read unread messages account-wide or in a folder without read receipts. With since_last_digest it returns what has not been summarised yet, bounded by the per-chat digest mark, and still writes nothing. {_UNTRUSTED}",
+        f"Read unread messages account-wide, in a folder, or in a saved collection, without read receipts. With since_last_digest it returns what has not been summarised yet, bounded by the per-chat digest mark, and still writes nothing. {_UNTRUSTED}",
         _tg_get_unread,
         _obj(
             {
                 "folder": {"type": "string"},
+                "collection": _COLLECTION,
                 "since": _SINCE,
                 "until": _UNTIL,
                 "max_chats": _LIMIT,
@@ -1587,6 +1763,49 @@ _TOOL_DEFS = [
                 "acknowledge": {"type": "boolean"},
             },
             ["chat"],
+        ),
+    ),
+    (
+        "tg_save_collection",
+        "Save a named local set of chats, with an optional exclude list, so a scope can be reused instead of re-listed every time. A chat in both lists is treated as excluded. Only local state changes.",
+        _tg_save_collection,
+        _obj(
+            {
+                "name": {"type": "string"},
+                "chats": _STRINGS,
+                "exclude": _STRINGS,
+                "replace": {"type": "boolean"},
+            },
+            ["name"],
+        ),
+    ),
+    (
+        "tg_list_collections",
+        "List saved chat collections. With a name, also reports its members, and marks any member that no longer exists in the dialog list.",
+        _tg_list_collections,
+        _obj({"name": _COLLECTION}),
+    ),
+    (
+        "tg_delete_collection",
+        "Delete one saved chat collection. Local state only.",
+        _tg_delete_collection,
+        _obj({"name": _COLLECTION}, ["name"]),
+    ),
+    (
+        "tg_read_collection",
+        f"Read a time window across a saved chat collection, with its exclusions applied, without read receipts. Supports the same digest bounding as tg_read_folder. {_UNTRUSTED}",
+        _tg_read_collection,
+        _obj(
+            {
+                "collection": _COLLECTION,
+                "since": _SINCE,
+                "until": _UNTIL,
+                "unread_only": {"type": "boolean"},
+                "chat_limit": _LIMIT,
+                "messages_per_chat": _LIMIT,
+                "since_last_digest": {"type": "boolean"},
+            },
+            ["collection"],
         ),
     ),
 ]
