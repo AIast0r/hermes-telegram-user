@@ -353,15 +353,20 @@ The repository is private, so GitHub credentials must be available non-interacti
 
 Install prompts for the three required variables and writes them to `<hermes home>/.env`; Hermes loads that file into the environment at gateway startup.
 
-**Installing `telethon` is a required manual step.** Hermes validates and *surfaces* a plugin's declared `python_dependencies` but never installs them — the field is annotated "validated and surfaced only" in `hermes_cli/plugins_manifest.py`. Install it into Hermes' own venv, not the system Python:
+**The dependency may need installing by hand.** Hermes takes a plugin's declared `python_dependencies` as a declaration and validates it, and some builds install them on `plugins install`/`enable` or after `update`; the build this was tested against (0.21.3) does not — its manifest field is annotated "validated and surfaced only", and `hermes plugins doctor` says so outright:
+
+```text
+WARN: declared python_dependencies not installed: telethon>=1.44,<2
+      — Hermes never auto-installs plugin dependencies
+```
+
+So run the install, then check with `hermes plugins doctor telegram-user`. If that warning is still there, install it into Hermes' own venv — not the system Python, or the plugin will not see it:
 
 ```bash
 <hermes home>/hermes-agent/venv/bin/python -m pip install 'telethon>=1.44,<2'
 ```
 
-That is exactly what `requirements.txt` contains; naming the requirement instead of the file avoids assuming where the plugin was installed.
-
-`hermes plugins doctor` warns until this is done (it reported the same warning on this machine, where the plugin loads but telethon is absent). Repeat it after `hermes update`: that rebuilds Hermes' venv from its own lock and strips anything not in it, so a manually installed package does not survive on its own.
+Repeat it after `hermes update`: that rebuilds Hermes' venv from its own lock and strips anything not in it, so a manually installed package does not survive on its own. Without telethon the plugin still imports and registers — `check_requirements()` returns false, so Hermes simply does not offer the platform or the toolset.
 
 Manual installation:
 
