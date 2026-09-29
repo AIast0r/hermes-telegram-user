@@ -101,7 +101,18 @@ def telegram_error_message(exc: BaseException) -> str:
             f"Telegram rate limited this session for {seconds} seconds. "
             f"Retry only after {seconds} seconds; do not retry immediately."
         )
-    return str(exc)
+    text = str(exc).strip()
+    if not text or text.startswith("(caused by"):
+        # Some RPC failures arrive with no message at all — sometimes as nothing but
+        # a ``(caused by <Request>)`` suffix. Passed through verbatim that reaches the
+        # model as an empty error, and an empty error it cannot act on is one it
+        # retries: the same call, over and over. Name the failure instead.
+        cause = exc.__cause__ or exc.__context__
+        detail = text.strip("() ") or (
+            type(cause).__name__ if cause is not None else type(exc).__name__
+        )
+        return f"Telegram returned no error text for this call ({detail})"
+    return text
 
 
 @asynccontextmanager

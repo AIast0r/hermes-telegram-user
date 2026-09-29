@@ -230,6 +230,15 @@ async def _tg_find_chat(args: dict[str, Any], **_: Any) -> str:
         return _error(exc)
 
 
+def _is_forum(entity: Any) -> bool:
+    """Whether Telegram exposes forum topics on this chat.
+
+    Telethon sets ``forum`` on channels that have topics enabled. Private chats are
+    never forums, whatever their client-side topic UI shows.
+    """
+    return bool(getattr(entity, "forum", False))
+
+
 async def _tg_list_topics(args: dict[str, Any], **_: Any) -> str:
     chat = str(args.get("chat") or "").strip()
     if not chat:
@@ -237,6 +246,35 @@ async def _tg_list_topics(args: dict[str, Any], **_: Any) -> str:
     try:
         async with tool_client() as client:
             entity = await resolve_chat(client, chat)
+            # GetForumTopicsRequest fails on anything that is not a forum, and that
+            # failure arrives without usable text, so the model cannot tell a wrong
+            # chat from a broken tool and calls it again and again. Answer the
+            # question here, where the entity is known.
+            if not _is_forum(entity):
+                label = entity_label(entity)
+                if getattr(entity, "first_name", None) or getattr(entity, "last_name", None):
+                    return _json(
+                        {
+                            "chat": label,
+                            "topics": [],
+                            "error": (
+                                f"{label} is a private chat, not a forum. Telegram exposes no API to "
+                                "list topics in a private chat, so this tool cannot enumerate them; "
+                                "read the chat directly instead."
+                            ),
+                        }
+                    )
+                return _json(
+                    {
+                        "chat": label,
+                        "topics": [],
+                        "error": (
+                            f"{label} is not a forum: topics are not enabled on it, so it has none to "
+                            "list. Do not retry this tool for this chat."
+                        ),
+                    }
+                )
+
             from telethon.tl.functions.messages import GetForumTopicsRequest
 
             result = await client(

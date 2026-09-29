@@ -547,3 +547,68 @@ def test_summary_only_folder_read_never_fetches_messages():
 
     assert len(payload["chats"]) == 41, "the whole folder, not the first 30 of it"
     assert all(chat["messages"] == [] for chat in payload["chats"])
+
+
+def test_an_emptied_telegram_error_still_names_the_failure():
+    """An error the model cannot read is one it retries.
+
+    GetForumTopicsRequest on a non-forum chat came back as
+    ``" (caused by GetForumTopicsRequest)"`` and the model called the tool seven
+    times in a single turn, because there was nothing in the error to act on.
+    """
+    limits = plugin_module("core.limits")
+    with isolated_state():
+        blank = limits.telegram_error_message(Exception(""))
+        caused = limits.telegram_error_message(Exception(" (caused by GetForumTopicsRequest)"))
+        plain = limits.telegram_error_message(Exception("chat not found"))
+
+    assert blank == "Telegram returned no error text for this call (Exception)"
+    assert "GetForumTopicsRequest" in caused, "the only useful part must survive"
+    assert plain == "chat not found", "a real message is passed through untouched"
+
+
+def test_list_topics_answers_for_a_chat_that_is_not_a_forum():
+    """The tool must not issue an RPC whose failure it cannot explain.
+
+    ``GetForumTopicsRequest`` fails on every chat that is not a forum, and that
+    failure carries no usable text. The entity is already resolved here, so the
+    answer comes from it instead of from a doomed round trip.
+    """
+    tools = _tools()
+    with isolated_state():
+
+        class _NotAForum:
+            first_name = "Al"
+            last_name = "st0r"
+
+        class _Client:
+            def __call__(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise AssertionError("no RPC may be issued for a non-forum chat")
+
+        originals = {
+            name: getattr(tools, name) for name in ("tool_client", "resolve_chat", "entity_label")
+        }
+
+        @contextlib.asynccontextmanager
+        async def fake_tool_client():
+            yield _Client()
+
+        async def fake_resolve(_client, _chat):
+            return _NotAForum()
+
+        tools.tool_client = fake_tool_client
+
+        def fake_label(_entity):
+            return "Al st0r"
+
+        for name, value in (("resolve_chat", fake_resolve), ("entity_label", fake_label)):
+            setattr(tools, name, value)
+        try:
+            payload = json.loads(_run(tools._tg_list_topics({"chat": "Al"})))
+        finally:
+            for name, value in originals.items():
+                setattr(tools, name, value)
+
+    assert payload["topics"] == []
+    assert "private chat" in payload["error"]
+    assert tools._is_forum(_NotAForum()) is False
