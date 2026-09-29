@@ -4,7 +4,7 @@ A **self-contained Hermes platform plugin** for controlling Hermes from your own
 
 No external MCP server is required. The plugin owns its Telegram bridge, read tools, folder/unread logic, media retrieval, voice transcript cache, aliases, sanitization, and Telegram rate-limit protection.
 
-Current plugin version: **0.8.0**.
+Current plugin version: **0.9.0**.
 
 ## Core UX: `.h` inside Telegram
 
@@ -49,7 +49,7 @@ Photos/files/voice notes are placed in Hermes' normal media cache. `MessageType.
 
 ## Telegram tools
 
-Version 0.8.0 exposes **34 tools** under the `telegram_user` toolset.
+Version 0.9.0 exposes **34 tools** under the `telegram_user` toolset.
 
 ### Chats/history/search
 
@@ -89,8 +89,18 @@ Useful prompts:
 `tg_transcribe_voice` stores successful transcripts in:
 
 ```text
-~/.hermes/state/telegram-user/transcripts.sqlite3
+<state dir>/transcripts.sqlite3
 ```
+
+`<state dir>` is the plugin's data root inside Hermes:
+
+```text
+<hermes home>/plugin-data/telegram-user/      # ~/.hermes/plugin-data/telegram-user on Linux
+```
+
+That is Hermes' sanctioned location for plugin state — it survives `hermes plugins update` / `remove` (which git-pull or delete the install tree) and follows the active profile, because Hermes resolves its home per call.
+
+`HERMES_TG_USER_STATE_DIR` overrides it. Without Hermes core importable — a standalone run, or this repo's own tests — the pre-convention path `~/.hermes/state/telegram-user/` is used instead.
 
 The key is `(chat_id, message_id)`. A repeat request returns the saved transcript instead of spending another STT call. Pass `refresh=true` only when you intentionally want to transcribe it again.
 
@@ -131,7 +141,7 @@ After Hermes calls `tg_set_alias`, tools accepting `chat` can resolve the exact 
 Aliases are stored locally in:
 
 ```text
-~/.hermes/state/telegram-user/aliases.json
+<state dir>/aliases.json
 ```
 
 Alias operations modify only the plugin's local state. They do not edit Telegram contacts and never store phone numbers.
@@ -159,7 +169,7 @@ Alias operations modify only the plugin's local state. They do not edit Telegram
 - `tg_archive_forget` — drop one chat from the archive.
 
 ```text
-~/.hermes/state/telegram-user/archive.sqlite3
+<state dir>/archive.sqlite3
 ```
 
 An edited message **replaces** its stored row, so the archive is a copy of what Telegram holds now, not a log of every version. Nothing is written to Telegram and no read pointer moves.
@@ -179,7 +189,7 @@ Exclusions win: an excluded scope is dropped **from this collection only** — i
 Both readers honour the same scopes: `tg_read_collection` reads a thread member through its own topic and `tg_get_unread` does too, so one collection never means two different things depending on which tool asked.
 
 ```text
-~/.hermes/state/telegram-user/collections.json
+<state dir>/collections.json
 ```
 
 Members are stored as Telegram **peer ids** — plus a topic root id for a thread — never titles or usernames: both change, and a renamed chat has to keep resolving.
@@ -211,7 +221,7 @@ Watermarks remember how far a chat — or a single forum thread — has already 
 - `tg_list_digest_marks` / `tg_forget_digest_marks` — inspect or clear marks, for a chat or one thread.
 
 ```text
-~/.hermes/state/telegram-user/digest_watermarks.json
+<state dir>/digest_watermarks.json
 ```
 
 The rules that keep this safe:
@@ -331,6 +341,8 @@ hermes plugins install AIast0r/hermes-telegram-user --enable
 
 The repository is private, so GitHub credentials must be available non-interactively to Hermes (`gh auth login`, `GITHUB_TOKEN`, `GH_TOKEN`, or your git credential helper).
 
+Install prompts for the three required variables and writes them to `<hermes home>/.env`; Hermes loads that file into the environment at gateway startup. It also installs `telethon` into Hermes' own venv from `python_dependencies` in `plugin.yaml`, and re-applies it after every `hermes update` — which rebuilds that venv from Hermes' lock and strips anything not declared. `requirements.txt` is kept for the manual path below and for `--no-deps` installs.
+
 Manual installation:
 
 ```bash
@@ -372,7 +384,7 @@ HERMES_TG_USER_MAX_MEDIA_MB=50
 HERMES_TG_USER_FLOOD_SLEEP_THRESHOLD=30
 HERMES_TG_USER_MAX_CONCURRENT_TOOLS=3
 HERMES_TG_USER_TOOL_MIN_INTERVAL_MS=150
-# HERMES_TG_USER_STATE_DIR=/custom/private/path
+# HERMES_TG_USER_STATE_DIR=/custom/private/path   # overrides <hermes home>/plugin-data/telegram-user
 ```
 
 ## Hermes platform config
@@ -423,8 +435,10 @@ python -m pytest tests/ -q
   scope: exclusion wins (a whole-chat exclusion drops its threads), a merge keeps
   stored names, the standing brief survives a member overwrite, and resolution is
   by peer id.
+- `tests/test_state_paths.py` — the state directory resolution order, including
+  the fallback, checked without creating anything under the real home.
 
-88 tests, all offline. `telethon` is optional: when it is importable the
+92 tests, all offline. `telethon` is optional: when it is importable the
 acknowledgement and selection tests assert against the real request classes and
 peer types, and when it is not they assert the documented fallback behaviour
 instead of passing vacuously.
