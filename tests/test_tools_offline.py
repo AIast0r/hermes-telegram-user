@@ -14,6 +14,7 @@ import inspect
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -426,3 +427,121 @@ def test_unread_of_a_folder_still_reads_whole_dialogs():
                 payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c", "up_to": bad})))
                 assert "up_to must be" in payload["error"]
         assert seen["acks"] == []
+
+
+def _digest_payload(chats: int, per_chat: int) -> dict[str, Any]:
+    """The shape ``tg_read_folder`` returns, sized like the production one."""
+    return {
+        "folder": {"id": 3, "title": "it/ai"},
+        "chat_count": chats,
+        "read_receipts_sent": False,
+        "since_last_digest": True,
+        "chats": [
+            {
+                "id": f"-100{index}",
+                "name": f"chat {index}",
+                "unread": index,
+                "messages": [
+                    {"id": number, "date": "2026-09-30T00:00:00+00:00", "text": "x" * 700}
+                    for number in range(per_chat)
+                ],
+            }
+            for index in range(chats)
+        ],
+    }
+
+
+def test_an_oversized_digest_is_trimmed_instead_of_spilled():
+    """A folder-wide digest has to fit in one turn.
+
+    41 chats x 50 messages is what ``tg_read_folder`` actually returned: 299 KB,
+    past Hermes' spillover threshold, which hands the model a stub instead of the
+    data — it then writes code to read the spilled file and spends the turn
+    recovering what it had already asked for. Trimming here is the difference
+    between one call and that hunt.
+    """
+    payload = _digest_payload(chats=41, per_chat=50)
+    assert len(json.dumps(payload)) > 300_000, "the fixture must reproduce the real size"
+
+    tools = _tools()
+    with isolated_state():
+        text = tools._json(payload)
+        parsed = json.loads(text)
+        budget = tools._RESULT_BUDGET_CHARS
+
+    assert len(text) <= budget, f"still {len(text)} chars, over the {budget} budget"
+    assert parsed["result_budget"]["trimmed"] is True
+    assert parsed["folder"] == {"id": 3, "title": "it/ai"}
+    assert parsed["chat_count"] == 41, "the summary is what the caller came for"
+
+    first = parsed["chats"][0]
+    assert first["name"] == "chat 0"
+    assert first["unread"] == 0
+    assert len(first["messages"]) == tools._TRIMMED_MESSAGES_PER_CHAT
+    assert first["messages_omitted"] == 50 - tools._TRIMMED_MESSAGES_PER_CHAT
+    assert first["messages"][-1]["id"] == 49, "the newest messages are the ones kept"
+
+
+def test_a_result_that_fits_is_returned_untouched():
+    """The budget is a floor on what survives, not a rewrite of every answer."""
+    payload = {"chat": "it/ai", "messages": [{"id": 1, "text": "hello"}]}
+    tools = _tools()
+    with isolated_state():
+        assert json.loads(tools._json(payload)) == payload
+
+
+def test_a_payload_the_trimmer_cannot_shrink_reports_instead_of_mangling():
+    """Last resort: a valid error beats invalid JSON or a silent cut."""
+    payload = {"odd_shape": ["x" * 300] * 400}
+    tools = _tools()
+    with isolated_state():
+        text = tools._json(payload)
+        parsed = json.loads(text)
+
+    assert len(text) <= tools._RESULT_BUDGET_CHARS
+    assert "error" in parsed
+    assert "hint" in parsed
+
+
+def test_summary_only_folder_read_never_fetches_messages():
+    """``messages_per_chat=0`` answers "what is in this folder" without the chats.
+
+    Without it the only folder-wide call dragged every message along — 41 chats,
+    299 KB — and the turn received a spillover stub instead of a chat list.
+    """
+    tools = _tools()
+    with isolated_state():
+        dialogs = [_FakeDialog(), _FakeDialog()]
+        originals = {
+            name: getattr(tools, name)
+            for name in ("tool_client", "_select_dialogs", "_read_messages", "dialog_summary")
+        }
+
+        @contextlib.asynccontextmanager
+        async def fake_tool_client():
+            yield object()
+
+        class _Folder:
+            id = 3
+            title = "it/ai"
+
+        async def fake_select_dialogs(_client, _token):
+            return _Folder(), dialogs
+
+        async def explode(*_args, **_kwargs):
+            raise AssertionError("messages_per_chat=0 must not read any messages")
+
+        tools.tool_client = fake_tool_client
+        tools._select_dialogs = fake_select_dialogs
+        tools._read_messages = explode
+        tools.dialog_summary = lambda dialog: {"id": str(id(dialog)), "name": "chat"}
+        try:
+            payload = json.loads(
+                _run(tools._tg_read_folder({"folder": "it/ai", "messages_per_chat": 0}))
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(tools, name, value)
+
+    assert len(payload["chats"]) == 2, "every chat in the folder is reported, messages or not"
+    assert all(chat["messages"] == [] for chat in payload["chats"])

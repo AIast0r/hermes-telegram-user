@@ -84,8 +84,91 @@ _STATUS_NAMES = {
 }
 
 
+#: A single tool result has to fit in a turn. Hermes spills anything past its own
+#: threshold to ``$HERMES_HOME/cache/spillover`` and hands the model a stub instead,
+#: so an oversized digest does not fail loudly — it costs the turn its data. The
+#: model sees a preview, writes code to read the spilled file, and spends the rest
+#: of the turn recovering what it already asked for. A folder-wide read hit exactly
+#: that: 41 chats x 50 messages, 299 KB, and a scavenger hunt. ``sanitize_structure``
+#: caps each *string*; nothing capped the total, which is what these do.
+_RESULT_BUDGET_CHARS = 60_000
+_TRIMMED_TEXT_LIMIT = 300
+_TRIMMED_MESSAGES_PER_CHAT = 3
+_TRIMMED_CHAT_LIMIT = 40
+
+
+def _oversized_note(value: Any) -> dict[str, Any]:
+    """Last resort for a payload the trimmer does not understand: report, never mangle."""
+    return {
+        "error": "result too large for one turn and cannot be trimmed automatically",
+        "hint": "narrow the request: pass since/until, lower the limit, or read one chat at a time",
+        "keys": sorted(k for k in value if isinstance(k, str))[:24] if isinstance(value, dict) else None,
+    }
+
+
+def _trim_row(row: Any) -> Any:
+    """Keep the newest messages of one chat row; the tail is what "what is new" wants."""
+    if not isinstance(row, dict):
+        return row
+    messages = row.get("messages")
+    if not isinstance(messages, list) or len(messages) <= _TRIMMED_MESSAGES_PER_CHAT:
+        return row
+    trimmed = dict(row)
+    trimmed["messages_omitted"] = len(messages) - _TRIMMED_MESSAGES_PER_CHAT
+    trimmed["messages"] = messages[-_TRIMMED_MESSAGES_PER_CHAT:]
+    return trimmed
+
+
+def _fit_result(value: Any) -> Any:
+    """Shrink an oversized message payload to something a turn can hold.
+
+    Only the shapes this toolset returns are rewritten — ``chats[].messages`` or a
+    top-level ``messages`` list. What was dropped is stated in ``result_budget``
+    rather than omitted silently, so the model can tell a short answer from a cut one.
+    """
+    if not isinstance(value, dict):
+        return _oversized_note(value)
+
+    result = dict(value)
+    dropped_chats = 0
+    chats = result.get("chats")
+    if isinstance(chats, list) and chats:
+        kept: list[Any] = []
+        for row in chats:
+            if len(kept) >= _TRIMMED_CHAT_LIMIT:
+                dropped_chats += 1
+                continue
+            kept.append(_trim_row(row))
+        result["chats"] = kept
+    elif isinstance(result.get("messages"), list):
+        result = _trim_row(result)
+
+    result["result_budget"] = {
+        "trimmed": True,
+        "reason": "the untrimmed result was too large for one turn",
+        "text_limit": _TRIMMED_TEXT_LIMIT,
+        "messages_per_chat_kept": _TRIMMED_MESSAGES_PER_CHAT,
+        "chats_dropped": dropped_chats,
+        "hint": (
+            "Narrow it: pass since/until, lower chat_limit or messages_per_chat, "
+            "or read the chat you care about with tg_read_messages."
+        ),
+    }
+    return result
+
+
 def _json(value: Any) -> str:
-    return json.dumps(sanitize_structure(value, string_limit=30000), ensure_ascii=False, default=str)
+    text = json.dumps(sanitize_structure(value, string_limit=30000), ensure_ascii=False, default=str)
+    if len(text) <= _RESULT_BUDGET_CHARS:
+        return text
+    text = json.dumps(
+        sanitize_structure(_fit_result(value), string_limit=_TRIMMED_TEXT_LIMIT),
+        ensure_ascii=False,
+        default=str,
+    )
+    if len(text) <= _RESULT_BUDGET_CHARS:
+        return text
+    return json.dumps(_oversized_note(value), ensure_ascii=False, default=str)
 
 
 def _error(exc: BaseException) -> str:
@@ -493,7 +576,10 @@ async def _tg_read_folder(args: dict[str, Any], **_: Any) -> str:
         until = parse_dt(args.get("until"))
         unread_only = bool(args.get("unread_only", False))
         chat_limit = bounded_int(args.get("chat_limit"), 30, 1, 100)
-        per_chat = bounded_int(args.get("messages_per_chat"), 50, 1, 500)
+        # 0 means "the folder's chat list, not its messages". The question this
+        # answers is "what is in here", and the only way to answer it before was to
+        # drag every chat's messages along — 41 chats, 299 KB, spilled to disk.
+        per_chat = bounded_int(args.get("messages_per_chat"), 50, 0, 500)
         digest = bool(args.get("since_last_digest", False))
         async with tool_client() as client:
             folder, dialogs = await _select_dialogs(client, folder_token)
@@ -505,19 +591,24 @@ async def _tg_read_folder(args: dict[str, Any], **_: Any) -> str:
                 bounds: dict[str, Any] = {}
                 if digest:
                     _key, bounds, digest_info = _digest_bounds(dialog.entity)
-                rows = await _read_messages(
-                    client,
-                    dialog.entity,
-                    limit=per_chat,
-                    since=since,
-                    until=until,
-                    **bounds,
-                )
-                if rows:
-                    entry = {**dialog_summary(dialog), "messages": rows}
-                    if digest:
-                        entry["digest"] = digest_info
-                    chats.append(entry)
+                rows: list[dict[str, Any]] = []
+                if per_chat:
+                    rows = await _read_messages(
+                        client,
+                        dialog.entity,
+                        limit=per_chat,
+                        since=since,
+                        until=until,
+                        **bounds,
+                    )
+                    # A window read reports the chats that have something in the
+                    # window; the summary-only form reports the folder itself.
+                    if not rows:
+                        continue
+                entry = {**dialog_summary(dialog), "messages": rows}
+                if digest:
+                    entry["digest"] = digest_info
+                chats.append(entry)
                 if len(chats) >= chat_limit:
                     break
             return _json(
@@ -1677,7 +1768,7 @@ _TOOL_DEFS = [
     ),
     (
         "tg_read_folder",
-        f"Read a time window across a Telegram folder without read receipts. With since_last_digest each chat is bounded by its own digest mark, so only unsummarised messages come back. {_UNTRUSTED}",
+        f"Read a time window across a Telegram folder without read receipts. With since_last_digest each chat is bounded by its own digest mark, so only unsummarised messages come back. Pass messages_per_chat=0 for the folder's chat list alone — names, unread counts, mute/archive flags, no message bodies — which is the cheap way to answer \"what is in this folder\" without pulling the conversations down with it. {_UNTRUSTED}",
         _tg_read_folder,
         _obj(
             {
