@@ -1,10 +1,11 @@
 """Tool-level behaviour that can be verified without Telegram and without telethon.
 
 Covers three things worth pinning:
-  * the registration contract — 28 tools, the right toolset, usable schemas;
+  * the registration contract — 29 tools, the right toolset, usable schemas;
   * every handler that decides *before* touching Telegram returns a structured
     error rather than raising, so a model can always read the failure;
-  * the digest watermark advance rule, faked at the client boundary.
+  * the marking contract — the badge and the local mark move together, and a
+    failed acknowledgement moves neither.
 """
 
 import asyncio
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _plugin_support import isolated_state, plugin_module  # noqa: E402
 
 EXPECTED_TOOLSET = "telegram_user"
-EXPECTED_TOOL_COUNT = 28
+EXPECTED_TOOL_COUNT = 29
 
 # handler name -> substring the structured error must contain
 GUARDED_HANDLERS = {
@@ -41,14 +42,43 @@ GUARDED_HANDLERS = {
     "_tg_archive_forget": "chat is required",
     "_tg_archive_search": "at least one of chat or query is required",
     "_tg_search_media": "global media search requires kind or query",
+    "_tg_mark_summarized": "chat is required",
 }
 
 # handlers that answer from local state only
-LOCAL_HANDLERS = ("_tg_list_aliases", "_tg_list_digest_marks", "_tg_forget_digest_marks", "_tg_archive_status")
+LOCAL_HANDLERS = (
+    "_tg_list_aliases",
+    "_tg_list_digest_marks",
+    "_tg_forget_digest_marks",
+    "_tg_archive_status",
+)
+
+# tools that read Telegram content, so they must carry the injection warning
+CONTENT_TOOLS = (
+    "tg_read_messages",
+    "tg_get_message_context",
+    "tg_search_messages",
+    "tg_search_global",
+    "tg_get_unread",
+    "tg_read_folder",
+    "tg_search_media",
+    "tg_get_pinned",
+    "tg_get_drafts",
+    "tg_get_scheduled",
+    "tg_get_profile",
+    "tg_archive_sync",
+    "tg_archive_search",
+)
+
+PEER = "555"
 
 
 def _tools():
     return plugin_module("tools")
+
+
+def _marks():
+    return plugin_module("core.state.watermarks")
 
 
 def _run(coro):
@@ -89,23 +119,8 @@ def test_registration_contract():
 
 def test_the_read_only_guard_text_is_attached_where_it_matters():
     tools = _tools()
-    guarded = {
-        "tg_read_messages",
-        "tg_get_message_context",
-        "tg_search_messages",
-        "tg_search_global",
-        "tg_get_unread",
-        "tg_read_folder",
-        "tg_search_media",
-        "tg_get_pinned",
-        "tg_get_drafts",
-        "tg_get_scheduled",
-        "tg_get_profile",
-        "tg_archive_sync",
-        "tg_archive_search",
-    }
-    by_name = {name: desc for name, desc, _h, _p in tools._TOOL_DEFS}
-    for name in sorted(guarded):
+    by_name = {name: desc for name, desc, _handler, _params in tools._TOOL_DEFS}
+    for name in CONTENT_TOOLS:
         assert "untrusted data" in by_name[name], f"{name} is missing the untrusted-data warning"
 
 
@@ -137,125 +152,144 @@ def test_ip_network_is_coarsened_and_never_echoed_in_full():
 
 
 @contextlib.contextmanager
-def _faked_client(tools, rows):
-    """Replace the Telegram boundary so the handler's own logic is what runs."""
-    originals = {name: getattr(tools, name) for name in
-                 ("tool_client", "resolve_chat", "_read_messages", "peer_id", "entity_label")}
-    fetched = []
+def _faked_marking(tools, *, fail_ack=False, topic_id=42):
+    """Replace the Telegram boundary so the handler's own ordering is what runs."""
+    names = (
+        "tool_client",
+        "resolve_chat",
+        "find_topic_root",
+        "acknowledge_read",
+        "peer_id",
+        "entity_label",
+    )
+    originals = {name: getattr(tools, name) for name in names}
+    seen = {"acks": [], "client": object()}
 
     @contextlib.asynccontextmanager
     async def fake_tool_client():
-        yield None
+        yield seen["client"]
 
-    async def fake_resolve_chat(client, chat, **kwargs):
-        return object()
+    async def fake_resolve_chat(_client, _chat, **_kwargs):
+        return "ENTITY"
 
-    async def fake_read_messages(client, entity, *, limit, since=None, until=None, **kwargs):
-        fetched.append(dict(kwargs))
-        return list(rows[0])
+    async def fake_find_topic(_client, _entity, _topic):
+        return topic_id
+
+    async def fake_acknowledge(_client, _entity, *, topic_id=None, up_to=None):
+        seen["acks"].append({"topic_id": topic_id, "up_to": up_to})
+        if fail_ack:
+            raise RuntimeError("telegram refused")
+        return {"scope": "topic" if topic_id else "chat", "topic_id": topic_id, "up_to": up_to}
 
     tools.tool_client = fake_tool_client
     tools.resolve_chat = fake_resolve_chat
-    tools._read_messages = fake_read_messages
-    tools.peer_id = lambda entity: "555"
-    tools.entity_label = lambda entity: "TestChat"
+    tools.find_topic_root = fake_find_topic
+    tools.acknowledge_read = fake_acknowledge
+    tools.peer_id = lambda _entity: PEER
+    tools.entity_label = lambda _entity: "TestChat"
     try:
-        yield fetched
+        yield seen
     finally:
         for name, value in originals.items():
             setattr(tools, name, value)
 
 
-def _ids(*values):
-    return [{"id": value, "text": f"m{value}"} for value in values]
-
-
-def test_digest_flag_refuses_a_filtered_walk():
-    """A filtered walk cannot prove it reached the mark, so it must not advance one."""
+def test_marking_moves_the_badge_and_the_mark_together():
     tools = _tools()
+    marks = _marks()
     with isolated_state():
-        rows = [[]]
-        with _faked_client(tools, rows):
-            for args in (
-                {"chat": "c", "since_last_digest": True, "since": "today"},
-                {"chat": "c", "since_last_digest": True, "until": "today"},
-                {"chat": "c", "since_last_digest": True, "topic": "general"},
-            ):
-                payload = json.loads(_run(tools._tg_read_messages(args)))
-                assert "cannot be combined" in payload["error"]
+        with _faked_marking(tools) as seen:
+            payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c", "up_to": 50})))
+
+        assert payload["up_to"] == 50
+        assert payload["mark"] == 50
+        assert payload["previous_mark"] == 0
+        assert payload["acknowledged"]["up_to"] == 50
+        assert seen["acks"] == [{"topic_id": None, "up_to": 50}]
+        assert marks.get_mark(PEER)["contiguous"] == 50
 
 
-def test_digest_advances_only_on_a_completed_walk():
+def test_a_failed_acknowledgement_moves_nothing():
+    """The acknowledgement runs first: if it fails, the mark must not have moved.
+
+    Otherwise the next digest would start after these messages while the owner's
+    badge still burns — messages lost silently, which is the failure this whole
+    design exists to avoid.
+    """
     tools = _tools()
-    marks = plugin_module("core.state.watermarks")
+    marks = _marks()
     with isolated_state():
-        rows = [_ids(10, 11, 12)]
-        with _faked_client(tools, rows):
-            payload = json.loads(_run(tools._tg_read_messages({"chat": "c", "since_last_digest": True})))
-        assert payload["digest"]["mark"] == 12
-        assert payload["digest"]["has_hole"] is False
-        assert marks.get_mark("555")["contiguous"] == 12
+        marks.set_mark(PEER, contiguous=10)
+
+        with _faked_marking(tools, fail_ack=True):
+            payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c", "up_to": 50})))
+
+        assert "error" in payload
+        assert marks.get_mark(PEER)["contiguous"] == 10, (
+            "the mark moved even though the badge was never cleared"
+        )
 
 
-def test_a_page_limited_walk_records_a_hole_and_does_not_advance():
+def test_marking_with_acknowledge_false_leaves_the_badge_alone():
     tools = _tools()
-    marks = plugin_module("core.state.watermarks")
+    marks = _marks()
     with isolated_state():
-        marks.advance("555", contiguous=12)
-        rows = [_ids(20, 21)]
-        with _faked_client(tools, rows) as fetched:
+        with _faked_marking(tools) as seen:
             payload = json.loads(
-                _run(tools._tg_read_messages({"chat": "c", "since_last_digest": True, "limit": 2}))
+                _run(tools._tg_mark_summarized({"chat": "c", "up_to": 30, "acknowledge": False}))
             )
-        assert fetched[0]["min_id"] == 12, "the fetch must start above the mark"
-        assert payload["digest"]["mark"] == 12, "a truncated walk must not advance"
-        assert payload["digest"]["has_hole"] is True
-        assert payload["digest"]["resume_max_id"] == 20
-        assert marks.get_mark("555")["contiguous"] == 12
+        assert seen["acks"] == [], "no read acknowledgement may be sent"
+        assert payload["acknowledged"] is None
+        assert payload["mark"] == 30
+        assert marks.get_mark(PEER)["contiguous"] == 30
 
 
-def test_the_next_walk_closes_the_hole_before_taking_new_traffic():
+def test_marking_without_a_position_refuses_to_guess():
+    """Falling back to 'the whole chat' would clear a badge for unsummarised text."""
     tools = _tools()
-    marks = plugin_module("core.state.watermarks")
+    marks = _marks()
     with isolated_state():
-        marks.advance("555", contiguous=100)
-        marks.advance("555", contiguous=200, top=500)
-
-        rows = [_ids(101, 150, 199)]  # the gap between the mark and the recorded hole
-        with _faked_client(tools, rows) as fetched:
-            payload = json.loads(_run(tools._tg_read_messages({"chat": "c", "since_last_digest": True})))
-
-        assert fetched[0]["min_id"] == 100
-        assert fetched[0]["max_id"] == 200, "the hole must be closed before newer traffic"
-        assert payload["digest"]["previous_mark"] == 100
-        assert payload["digest"]["resumed_hole"] is True
-        # Closing the gap makes 100..500 contiguous, so the mark jumps to the top
-        # the earlier truncated walk had already seen.
-        assert marks.get_mark("555")["contiguous"] == 500
-        assert marks.get_mark("555")["has_hole"] is False
+        with _faked_marking(tools) as seen:
+            payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c"})))
+        assert "no position to mark" in payload["error"]
+        assert seen["acks"] == []
+        assert marks.get_mark(PEER) is None
 
 
-def test_an_empty_digest_read_leaves_the_mark_alone():
+def test_marking_without_a_position_uses_the_recorded_one():
     tools = _tools()
-    marks = plugin_module("core.state.watermarks")
+    marks = _marks()
     with isolated_state():
-        marks.advance("555", contiguous=99)
-        rows = [[]]
-        with _faked_client(tools, rows):
-            payload = json.loads(_run(tools._tg_read_messages({"chat": "c", "since_last_digest": True})))
-        assert payload["count"] == 0
-        assert payload["digest"]["mark"] == 99
-        assert marks.get_mark("555")["contiguous"] == 99
+        marks.set_mark(PEER, contiguous=77)
+        with _faked_marking(tools) as seen:
+            payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c"})))
+        assert payload["up_to"] == 77
+        assert seen["acks"] == [{"topic_id": None, "up_to": 77}]
 
 
-def test_reading_without_the_digest_flag_never_touches_the_mark():
+def test_marking_a_thread_uses_the_thread_scope():
     tools = _tools()
-    marks = plugin_module("core.state.watermarks")
+    marks = _marks()
     with isolated_state():
-        rows = [_ids(5, 6)]
-        with _faked_client(tools, rows) as fetched:
-            payload = json.loads(_run(tools._tg_read_messages({"chat": "c"})))
-        assert payload["digest"] is None
-        assert payload["since_last_digest"] is False
-        assert "min_id" not in fetched[0]
-        assert marks.get_mark("555") is None
+        marks.set_mark(PEER, contiguous=100)  # the whole-chat mark
+        with _faked_marking(tools, topic_id=42) as seen:
+            payload = json.loads(
+                _run(tools._tg_mark_summarized({"chat": "c", "topic": "general", "up_to": 20}))
+            )
+
+        assert payload["thread_id"] == "42"
+        assert seen["acks"] == [{"topic_id": 42, "up_to": 20}]
+        assert marks.get_mark(PEER, "42")["contiguous"] == 20
+        assert marks.get_mark(PEER)["contiguous"] == 100, (
+            "marking one thread must not move the whole-chat mark"
+        )
+
+
+def test_a_nonsense_position_is_refused():
+    tools = _tools()
+    with isolated_state():
+        with _faked_marking(tools) as seen:
+            for bad in (0, -3, "later"):
+                payload = json.loads(_run(tools._tg_mark_summarized({"chat": "c", "up_to": bad})))
+                assert "up_to must be" in payload["error"]
+        assert seen["acks"] == []

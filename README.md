@@ -4,7 +4,7 @@ A **self-contained Hermes platform plugin** for controlling Hermes from your own
 
 No external MCP server is required. The plugin owns its Telegram bridge, read tools, folder/unread logic, media retrieval, voice transcript cache, aliases, sanitization, and Telegram rate-limit protection.
 
-Current plugin version: **0.5.0**.
+Current plugin version: **0.6.0**.
 
 ## Core UX: `.h` inside Telegram
 
@@ -49,7 +49,7 @@ Photos/files/voice notes are placed in Hermes' normal media cache. `MessageType.
 
 ## Telegram tools
 
-Version 0.5.0 exposes **28 tools** under the `telegram_user` toolset.
+Version 0.6.0 exposes **29 tools** under the `telegram_user` toolset.
 
 ### Chats/history/search
 
@@ -70,7 +70,7 @@ Message results can include reply quote, forward origin, album/group id, edited/
 
 Folder membership is evaluated locally using Telegram filter semantics: explicit include/exclude/pinned peers, contacts/non-contacts, groups, channels, bots, muted/read/archive exclusion, unread mentions, and manually marked-unread dialogs.
 
-These operations do **not** call Telegram read-acknowledgement APIs.
+These operations do **not** call Telegram read-acknowledgement APIs. Reading a chat here never clears its badge — see [Marking a summary as read](#marking-a-summary-as-read) for the one tool that does.
 
 Useful prompts:
 
@@ -166,10 +166,11 @@ An edited message **replaces** its stored row, so the archive is a copy of what 
 
 ### Digest watermarks
 
-Watermarks remember how far a chat has already been digested, so a later summary can ask for what is new only:
+Watermarks remember how far a chat — or a single forum thread — has already been summarised, so a later digest can ask for what is new only:
 
-- `tg_read_messages` takes `since_last_digest` — return only what arrived after this chat's last digest, and advance the mark.
-- `tg_list_digest_marks` / `tg_forget_digest_marks` — inspect or clear the marks.
+- `tg_get_unread` / `tg_read_folder` take `since_last_digest` — read only what is not yet summarised, bounded by the mark. They write nothing.
+- `tg_mark_summarized` — record that a summary covered this scope, and clear its badge (see [Marking a summary as read](#marking-a-summary-as-read)).
+- `tg_list_digest_marks` / `tg_forget_digest_marks` — inspect or clear marks, for a chat or one thread.
 
 ```text
 ~/.hermes/state/telegram-user/digest_watermarks.json
@@ -177,11 +178,11 @@ Watermarks remember how far a chat has already been digested, so a later summary
 
 The rules that keep this safe:
 
-- a mark is keyed by Telegram **peer id**, never by chat name;
-- the mark only advances when a walk provably reached the previous mark;
-- a walk cut short by the page limit records a gap and does **not** advance, so a truncated run can never silently skip messages;
-- the next walk closes that gap before taking newer traffic;
-- `since_last_digest` refuses to combine with `since`/`until`/`topic`, because a filtered walk cannot prove it reached the mark.
+- a mark is keyed by Telegram **peer id**, plus a thread id for a forum topic — never by chat name;
+- a mark only ever moves forward, and only `tg_mark_summarized` moves it; reading never does;
+- a mark is set either to the position the last digest read reached, or to an explicit `up_to` — never to "the top of the chat";
+- the badge acknowledgement is sent *before* the mark moves, so a refused call changes nothing;
+- the archive and media tools never touch marks.
 
 ## Telegram FloodWait/rate-limit protection
 
@@ -234,15 +235,40 @@ There is intentionally no brittle keyword blacklist: a normal Telegram message c
 
 ## Security model
 
-Telegram-facing model tools remain read-only:
+Telegram-facing model tools are read-only, with exactly one deliberate exception:
 
 - no `tg_send_message`;
 - no arbitrary model-controlled reply;
 - no reaction tool;
-- no mark-read/read-ack tool;
+- **one** tool clears the unread badge: `tg_mark_summarized`. It is scoped to a single chat or a single forum thread, always bounded by an explicit message id, refuses to guess a position, and is meant to be called *after* a summary exists — never as a bulk "mark everything read";
 - no background watcher/autopilot.
 
+The read acknowledgement is built from explicit `ReadHistoryRequest` / `ReadDiscussionRequest` calls in `core/readstate.py` rather than Telethon's blanket `send_read_acknowledge`, so the peer-kind dispatch is visible; a contract test asserts that this module is the only place in the package that acknowledges anything, and that no tool name offers a bulk variant.
+
 The platform adapter itself must edit the owner's `.h` message to implement the UX and retains the platform contract's host-driven delivery path, but those operations are not exposed as model tools.
+
+## Marking a summary as read
+
+A digest that summarised a chat should also stop your phone from showing it as unread — otherwise you re-read by hand exactly what Hermes already read for you.
+
+The rule is that Hermes marks **after** the summary exists:
+
+1. `tg_get_unread` or `tg_read_folder` with `since_last_digest=true` reads only what is not yet summarised (bounded by the per-chat mark, and it writes nothing);
+2. Hermes writes the summary;
+3. `tg_mark_summarized` records the position and clears the badge for that same scope.
+
+```text
+.h что нового в папке Работа?      # 1 — читает только несаммаризованное
+.h суммаризуй ветку Releases      # 2 — саммари по конкретной ветке форума
+tg_mark_summarized(chat="Work", topic="Releases", up_to=1234)   # 3
+```
+
+Semantics worth knowing:
+
+- `up_to` defaults to the position the last digest read reached; if nothing was read yet, the tool **refuses** rather than guessing, because guessing would clear a badge for messages nobody summarised;
+- the acknowledgement is sent **before** the local mark moves. If Telegram refuses (FloodWait, permissions, network), nothing moves and the next digest returns the same messages — a repeated summary instead of a silent gap;
+- `topic` marks one forum thread without touching the whole-chat position or its sibling threads;
+- `acknowledge=false` records the position locally and leaves the badge alone.
 
 `HERMES_TG_USER_SESSION` is equivalent to account access and must be treated as a password.
 
@@ -344,12 +370,20 @@ python -m pytest tests/ -q
 ```
 
 - `tests/test_smoke.py` — source-level contract checks: the tool surface matches
-  `plugin.yaml` exactly (names, count, version), the read-only guarantees hold,
-  and the rate-limit/single-instance wiring is present.
+  `plugin.yaml` exactly (names, count, version), exactly one module may
+  acknowledge a read, and the rate-limit/single-instance wiring is present.
+- `tests/test_readstate.py` — the acknowledgement dispatch: which request each
+  peer kind gets, and that an unbounded "mark everything read" is refused.
 - `tests/test_state_archive.py` — the archive storage and search layer.
-- `tests/test_watermarks.py` — mark monotonicity and the gap-aware advance rule.
+- `tests/test_watermarks.py` — mark monotonicity, gap handling, per-thread
+  isolation and the explicit assertion semantics.
 - `tests/test_tools_offline.py` — tool registration, every handler that can
-  refuse bad input without touching Telegram, and the digest advance rule.
+  refuse bad input without touching Telegram, and the marking contract
+  (badge and mark move together; a refused acknowledgement moves neither).
+
+66 tests, all offline. `telethon` is optional: when it is importable the
+acknowledgement tests assert against the real request classes, and when it is
+not they assert that the module fails loudly instead of silently skipping.
 
 `pytest` is not listed in `requirements.txt`; install it separately.
 
@@ -359,7 +393,8 @@ python -m pytest tests/ -q
 - Telegram rate limits are dynamic; the local limiter reduces risk but cannot guarantee that Telegram never returns FloodWait.
 - Transcript caching applies to `tg_transcribe_voice`; Hermes' central automatic STT for a live `.h` voice/reply has its own runtime path.
 - Aliases are exact local mappings; the plugin intentionally does not fuzzy-guess a different person.
-- `since_last_digest` is wired into `tg_read_messages`. `tg_get_unread` and `tg_read_folder` still read whole windows.
+- `since_last_digest` bounds `tg_get_unread` and `tg_read_folder` at whole-chat scope. Per-thread bounding inside a folder digest is not wired yet: read a specific thread with `tg_read_messages(topic=...)` and mark it with `tg_mark_summarized(topic=...)`.
+- `tg_mark_summarized` is the only tool that writes to Telegram, and it is irreversible: once a scope is marked, your unread reminder for it is gone. Marking something you did not actually summarise loses it from your attention — that is the trade the design makes deliberately, in exchange for not re-reading. Use `acknowledge=false` to record the position without touching the badge.
 - The archive stores text and metadata, not attachment bytes, and it does not track deletions — a message deleted in Telegram stays in the archive until the chat is re-synced or dropped with `tg_archive_forget`.
 - `tg_archive_sync` does not hold a global lock, so two concurrent syncs of the same chat can interleave. They converge, but the reported counts may overlap.
 - No external MCP is required and no Hermes core patch is required.

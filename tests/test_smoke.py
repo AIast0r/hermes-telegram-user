@@ -32,6 +32,7 @@ def test_required_files_exist():
         "core/helpers.py",
         "core/limits.py",
         "core/media.py",
+        "core/readstate.py",
         "core/sanitize.py",
         "core/state/aliases.py",
         "core/state/archive.py",
@@ -82,12 +83,12 @@ def test_tool_surface_matches_manifest():
     """plugin.yaml is the published contract; tools.py must register exactly that set."""
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     source = (ROOT / "tools.py").read_text(encoding="utf-8")
-    assert "version: 0.5.0" in manifest
+    assert "version: 0.6.0" in manifest
     published = [
         line.strip()[2:] for line in manifest.splitlines() if line.strip().startswith("- tg_")
     ]
-    assert len(published) == 28
-    assert len(set(published)) == 28
+    assert len(published) == 29
+    assert len(set(published)) == 29
     registered = set(re.findall(r'^ {8}"(tg_[a-z_]+)",$', source, re.MULTILINE))
     assert registered == set(published), (
         f"manifest-only: {sorted(set(published) - registered)}; "
@@ -118,22 +119,49 @@ def test_tool_surface_matches_manifest():
         "tg_archive_forget",
         "tg_list_digest_marks",
         "tg_forget_digest_marks",
+        "tg_mark_summarized",
     ):
         assert tool in published
 
 
-def test_no_model_facing_telegram_write_tools_or_read_receipts():
-    tools = (ROOT / "tools.py").read_text(encoding="utf-8")
+def test_only_one_scoped_tool_may_write_telegram_read_state():
+    """The old rule was 'never acknowledge a read'. The rule is now 'exactly one
+    scoped path'.
+
+    Looking at a chat still clears nothing; the single exception is
+    `tg_mark_summarized`, which forwards an explicit message id for one chat or
+    one forum thread, and only after a summary exists.
+    """
+    tools_source = (ROOT / "tools.py").read_text(encoding="utf-8")
     for forbidden in (
         '"tg_send_message"',
         '"tg_reply_message"',
         '"tg_react"',
         '"tg_mark_read"',
     ):
-        assert forbidden not in tools
-    all_source = "\n".join(path.read_text(encoding="utf-8") for path in _package_sources())
-    assert "send_read_acknowledge(" not in all_source
-    assert "mark_read(" not in all_source
+        assert forbidden not in tools_source, f"{forbidden} would be a bulk Telegram write tool"
+
+    sources = {
+        path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in _package_sources()
+    }
+
+    # The blanket Telethon helper hides the peer-kind dispatch, so it stays banned.
+    for name, source in sources.items():
+        assert "send_read_acknowledge(" not in source, f"{name} acknowledges reads the invisible way"
+
+    acknowledging = sorted(
+        name
+        for name, source in sources.items()
+        if "ReadHistoryRequest(" in source or "ReadDiscussionRequest(" in source
+    )
+    assert acknowledging == ["core/readstate.py"], (
+        f"read acknowledgement must live in exactly one module: {acknowledging}"
+    )
+
+    # ...and be reachable from exactly one tool.
+    assert tools_source.count("acknowledge_read(") == 1
+    assert '"tg_mark_summarized"' in tools_source
 
 
 def test_floodwait_and_single_instance_guards_are_wired():

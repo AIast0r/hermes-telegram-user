@@ -18,6 +18,15 @@ So a mark here is *two* numbers, not one.
     mark does not move while a hole is open, because moving it across a gap
     makes every message inside the gap unreachable forever.
 
+A mark belongs to a *scope*: a whole chat, or one topic of a forum. A single
+number per chat cannot describe a forum — digesting one topic would mark every
+sibling topic as digested too — so the scope is part of the key. A whole-chat
+mark keeps the bare canonical peer id as its key (the shape every file written
+before topics existed already has) and one topic is keyed ``<peer id>:<topic
+id>``. Both halves of a composite key are canonical integers, so neither can
+contain the separator: a peer id can never collide with a composite key, and a
+composite can never be read as a peer.
+
 The four failure modes of the design this replaces
 (``other/tgai/tgai/storage.py`` + ``commands/aggregate.py``) are each closed
 here explicitly:
@@ -29,13 +38,16 @@ here explicitly:
   ``peer_id`` and ``transcripts.sqlite3``'s ``chat_id``.
 * **the mark advances only on proof of contiguity.** ``advance`` can never move
   ``contiguous`` backwards, and a report that does not reach down to the
-  current mark leaves the mark alone instead of jumping it.
+  current mark leaves the mark alone instead of jumping it. The one writer that
+  is not a walk report is :func:`set_mark`, where the caller *asserts* how far
+  the scope has been read: it moves the mark to the id it is given (or leaves
+  it, being non-decreasing) and never past it to a stale ``pending_top_id``.
 * **a truncated page records a hole instead of being skipped.** A run that
   stopped short leaves ``pending_from_id``/``pending_top_id`` behind, and
   :func:`resume_bounds` hands the next fetch the cursors that close it first.
 * **atomic and locked.** The file is written tmp-file → ``0600`` → ``os.replace``,
   every mutation holds a module lock, and :func:`watermark_lock` serialises the
-  read-fetch-write cycles of one chat.
+  read-fetch-write cycles of one scope.
 
 None of this touches Telegram: a watermark is written locally and a read
 pointer is never acknowledged, so a digest can be repeated at no cost.
@@ -62,11 +74,16 @@ __all__ = [
     "get_mark",
     "list_marks",
     "resume_bounds",
+    "set_mark",
     "watermark_lock",
 ]
 
 _FILENAME = "digest_watermarks.json"
 _VERSION = 1
+#: Splits a composite key into peer and topic. Both halves are canonical
+#: integers, so neither can contain it and no peer id can ever collide with a
+#: composite key.
+_THREAD_SEP = ":"
 #: Telegram ids are int32 on the wire; anything larger is a caller bug, and a
 #: mark that is too large would answer "nothing is new" about everything.
 _MAX_MESSAGE_ID = 2**31 - 1
@@ -75,8 +92,8 @@ _MAX_MESSAGE_ID = 2**31 - 1
 _MAX_PEER_ID_LEN = 40
 
 _LOCK = threading.RLock()
-_PEER_LOCKS_LOCK = threading.Lock()
-_PEER_LOCKS: dict[str, threading.Lock] = {}
+_SCOPE_LOCKS_LOCK = threading.Lock()
+_SCOPE_LOCKS: dict[str, threading.Lock] = {}
 _cache: Optional[dict[str, dict[str, Any]]] = None
 
 
@@ -105,12 +122,75 @@ def _peer_key(peer_id: str | int) -> str:
     return str(value)
 
 
+def _thread_key(thread_id: Any) -> Optional[str]:
+    """Canonical topic id, ``None`` for a whole chat, or ``ValueError``.
+
+    A topic id is the id of the topic's first message, so it is canonicalised
+    and range-checked exactly like a peer id. ``None``, ``0`` and the empty
+    string all mean "the whole chat": an absent topic and a zero topic are the
+    same scope, and hiding that difference here keeps a caller from having to
+    know which shape its own input happens to be in.
+    """
+    if thread_id is None:
+        return None
+    if isinstance(thread_id, bool):
+        raise ValueError("thread_id must be a Telegram topic id")
+    raw = sanitize_name(str(thread_id), limit=_MAX_PEER_ID_LEN).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("thread_id must be a numeric Telegram topic id") from None
+    if value == 0:
+        return None
+    if value < 0 or value > _MAX_MESSAGE_ID:
+        raise ValueError("thread_id is out of range")
+    return str(value)
+
+
+def _composite(peer_id: str, thread_id: Optional[str]) -> str:
+    """The storage key of one scope."""
+    return peer_id if thread_id is None else f"{peer_id}{_THREAD_SEP}{thread_id}"
+
+
+def _mark_key(peer_id: str | int, thread_id: Any = None) -> tuple[str, Optional[str], str]:
+    """``(peer_id, thread_id, storage key)`` for the scope a caller named."""
+    peer = _peer_key(peer_id)
+    thread = _thread_key(thread_id)
+    return peer, thread, _composite(peer, thread)
+
+
+def _stored_scope(key: Any) -> Optional[tuple[str, Optional[str]]]:
+    """``(peer_id, thread_id)`` for a key read off disk, or ``None`` if unusable.
+
+    Two shapes are accepted and nothing else: a bare canonical id is a
+    whole-chat mark — every file written before topics existed is made of
+    these — and ``peer:thread`` is one topic's mark. Both halves are reparsed
+    and re-canonicalised here, so a hand-edited key cannot smuggle a
+    non-numeric, negative or zero-scoped id into the store where the two key
+    spaces would overlap.
+    """
+    if not isinstance(key, str):
+        return None
+    peer_raw, sep, thread_raw = key.partition(_THREAD_SEP)
+    peer = _coerce_stored_id(peer_raw)
+    if peer is None:
+        return None
+    if not sep:
+        return str(peer), None
+    thread = _coerce_stored_id(thread_raw)
+    if thread is None or thread < 1:
+        return None
+    return str(peer), str(thread)
+
+
 def _message_id(value: Any, *, field: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field} must be a message id")
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{field} must be a message id") from None
     if parsed < 0 or parsed > _MAX_MESSAGE_ID:
         raise ValueError(f"{field} is out of range")
@@ -183,11 +263,11 @@ def _load_unlocked() -> dict[str, dict[str, Any]]:
         stored = raw.get("marks")
         if isinstance(stored, dict):
             for key, value in stored.items():
-                canonical = _coerce_stored_id(key)
+                scope = _stored_scope(key)
                 mark = _normalize_mark(value)
-                if canonical is None or mark is None:
+                if scope is None or mark is None:
                     continue
-                loaded[str(canonical)] = mark
+                loaded[_composite(*scope)] = mark
     _cache = loaded
     return _cache
 
@@ -204,9 +284,10 @@ def _save_unlocked(marks: dict[str, dict[str, Any]]) -> None:
     _cache = marks
 
 
-def _row(peer_id: str, mark: dict[str, Any]) -> dict[str, Any]:
+def _row(peer_id: str, thread_id: Optional[str], mark: dict[str, Any]) -> dict[str, Any]:
     return {
         "peer_id": peer_id,
+        "thread_id": thread_id,
         "contiguous": mark["contiguous"],
         "pending_from_id": mark["pending_from_id"],
         "pending_top_id": mark["pending_top_id"],
@@ -215,27 +296,28 @@ def _row(peer_id: str, mark: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _peer_lock(peer_id: str | int) -> threading.Lock:
-    key = _peer_key(peer_id)
-    with _PEER_LOCKS_LOCK:
-        lock = _PEER_LOCKS.get(key)
+def _scope_lock(key: str) -> threading.Lock:
+    with _SCOPE_LOCKS_LOCK:
+        lock = _SCOPE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
-            _PEER_LOCKS[key] = lock
+            _SCOPE_LOCKS[key] = lock
         return lock
 
 
 @asynccontextmanager
-async def watermark_lock(peer_id: str | int) -> AsyncIterator[None]:
-    """Serialise one chat's read-fetch-advance cycle.
+async def watermark_lock(peer_id: str | int, thread_id: Any = None) -> AsyncIterator[None]:
+    """Serialise one scope's read-fetch-advance cycle.
 
-    Prevents two concurrent digests of the same chat from both reading the same
+    Prevents two concurrent digests of the same scope from both reading the same
     ``min_id``, both fetching the same window and both advancing the mark: the
     loser would report messages the winner already digested, and a hole it
-    opens could be closed by the wrong run. The lock is per peer, so digests of
-    different chats still run concurrently.
+    opens could be closed by the wrong run. The lock is per scope, so digests of
+    different chats — and of different topics of one forum — still run
+    concurrently; only writers of the same mark are held apart.
     """
-    lock = _peer_lock(peer_id)
+    _, _, key = _mark_key(peer_id, thread_id)
+    lock = _scope_lock(key)
     await asyncio.to_thread(lock.acquire)
     try:
         yield
@@ -243,35 +325,49 @@ async def watermark_lock(peer_id: str | int) -> AsyncIterator[None]:
         lock.release()
 
 
-def get_mark(peer_id: str | int) -> Optional[dict[str, Any]]:
-    """One chat's mark, or ``None`` when that chat has never been digested.
+def get_mark(peer_id: str | int, thread_id: Any = None) -> Optional[dict[str, Any]]:
+    """One scope's mark, or ``None`` when that scope has never been digested.
 
     Prevents a caller from inventing a default mark (typically "everything so
-    far") for a chat that has no mark at all: the distinction between "nothing
+    far") for a scope that has no mark at all: the distinction between "nothing
     digested yet" and "digested up to id N" is the whole reason the file exists,
-    so its absence is reported rather than papered over.
+    so its absence is reported rather than papered over. The row names both
+    halves of the scope, so a caller that walks several topics at once can tell
+    the rows apart without remembering what it asked for.
     """
-    key = _peer_key(peer_id)
+    peer, thread, key = _mark_key(peer_id, thread_id)
     with _LOCK:
         mark = _load_unlocked().get(key)
-        return _row(key, mark) if mark is not None else None
+        return _row(peer, thread, mark) if mark is not None else None
 
 
 def list_marks() -> list[dict[str, Any]]:
-    """Every stored mark, ordered by numeric peer id.
+    """Every stored mark, ordered by peer id and then by scope.
 
     Prevents a caller from reporting on "all chats" by walking an unordered
     dict: the order is fixed here so two runs with the same state produce the
-    same list, which is what makes a diff of two digests readable.
+    same list, which is what makes a diff of two digests readable. A chat's
+    whole-chat mark sorts before its topics (the floor sorts first), so the
+    list reads as one chat's states in the order they were created.
     """
     with _LOCK:
-        rows = [_row(key, mark) for key, mark in _load_unlocked().items()]
-    rows.sort(key=lambda row: int(row["peer_id"]))
+        rows = []
+        for key, mark in _load_unlocked().items():
+            scope = _stored_scope(key)
+            if scope is not None:
+                rows.append(_row(scope[0], scope[1], mark))
+    rows.sort(key=lambda row: (int(row["peer_id"]), -1 if row["thread_id"] is None else int(row["thread_id"])))
     return rows
 
 
-def advance(peer_id: str | int, *, contiguous: int, top: int | None = None) -> dict[str, Any]:
-    """Record the outcome of one walk over a chat and return the resulting mark.
+def advance(
+    peer_id: str | int,
+    *,
+    contiguous: int,
+    top: int | None = None,
+    thread_id: Any = None,
+) -> dict[str, Any]:
+    """Record the outcome of one walk over a scope and return the resulting mark.
 
     ``contiguous`` is the lowest id the walk reached; ``top`` is the highest id
     it saw. With ``top=None`` the walk reached the floor it aimed at and
@@ -281,13 +377,18 @@ def advance(peer_id: str | int, *, contiguous: int, top: int | None = None) -> d
     ends are recorded for :func:`resume_bounds` (an open hole only ever grows;
     it is cleared by a walk that reaches the mark, or by ``top=None``).
 
+    ``thread_id`` names the topic the walk covered; with it omitted (or ``None``/
+    ``0``/``""``) the walk covered the whole chat. A topic's walk touches only
+    that topic's mark, and a whole-chat walk only the chat-wide one: the two are
+    separate records even though one chat contains the other.
+
     Prevents the two failures of a single-number mark: moving it backwards
     (a shorter walk being mistaken for an older state) and jumping it across a
     limit-truncated page, which would leave the messages under the jump
     undigested and unreachable. A no-op report writes nothing, so ``updated_at``
     still means "when the mark last changed".
     """
-    key = _peer_key(peer_id)
+    peer, thread, key = _mark_key(peer_id, thread_id)
     low = _message_id(contiguous, field="contiguous")
     high = None if top is None else _message_id(top, field="top")
     if high is not None and high < low:
@@ -313,10 +414,61 @@ def advance(peer_id: str | int, *, contiguous: int, top: int | None = None) -> d
             mark["updated_at"] = _now()
             marks[key] = mark
             _save_unlocked(marks)
-        return _row(key, mark)
+        return _row(peer, thread, mark)
 
 
-def resume_bounds(peer_id: str | int) -> dict[str, Any]:
+def set_mark(
+    peer_id: str | int,
+    *,
+    contiguous: int,
+    thread_id: Any = None,
+) -> dict[str, Any]:
+    """Assert how far a scope has been read, and return the resulting mark.
+
+    This is the explicit counterpart to :func:`advance`. A walk report says
+    "this is as far as the fetch got", so a completed walk is allowed to jump
+    the mark up to a ``pending_top_id`` seen earlier and clear the hole with it.
+    An assertion says "everything up to N is done", where that jump would be
+    wrong: ``pending_top_id`` is the highest id ever *seen* while a hole was
+    open, so lifting the mark to it would claim a middle region the caller
+    never vouched for. Here the mark becomes the id the caller names — never
+    that id plus anything — and the hole is cleared because the assertion is
+    exactly the proof of contiguity the hole was waiting for.
+
+    The mark is non-decreasing, so a lower assertion is a no-op rather than a
+    rollback, and a caller cannot lower a mark by asserting a stale value. A
+    no-op writes nothing, so ``updated_at`` still means "when the mark last
+    changed".
+
+    ``contiguous`` must be a positive message id: unlike a walk report, which
+    can legitimately cover nothing (``contiguous=0``), an assertion about an
+    empty range asserts nothing and is refused rather than stored as a mark of
+    zero that would make every later read look new. A fractional id is refused
+    for the same reason — an assertion is a claim about an id, so ``1.5`` is a
+    caller bug rather than a silent claim about id ``1``.
+    """
+    peer, thread, key = _mark_key(peer_id, thread_id)
+    value = _message_id(contiguous, field="contiguous")
+    if isinstance(contiguous, float) and not contiguous.is_integer():
+        raise ValueError("contiguous must be a whole message id")
+    if value < 1:
+        raise ValueError("contiguous must be a positive message id")
+    with _LOCK:
+        marks = dict(_load_unlocked())
+        mark = dict(marks.get(key) or _empty_mark())
+        before = (mark["contiguous"], mark["pending_from_id"], mark["pending_top_id"])
+        mark["contiguous"] = max(mark["contiguous"], value)
+        mark["pending_from_id"] = None
+        mark["pending_top_id"] = None
+        after = (mark["contiguous"], mark["pending_from_id"], mark["pending_top_id"])
+        if after != before:
+            mark["updated_at"] = _now()
+            marks[key] = mark
+            _save_unlocked(marks)
+        return _row(peer, thread, mark)
+
+
+def resume_bounds(peer_id: str | int, thread_id: Any = None) -> dict[str, Any]:
     """The cursors a fetch should use, closing a pending hole before anything new.
 
     ``min_id`` is the mark (the exclusive floor: digested ids are never
@@ -326,14 +478,19 @@ def resume_bounds(peer_id: str | int) -> dict[str, Any]:
     hole from being refilled by newer traffic forever: every run that starts at
     the top without it re-reads the same newest page and the old messages are
     never reached.
+
+    The bounds belong to one scope — a chat, or one topic of a forum — so a
+    topic's hole never sends a chat-wide fetch back to an old page, and a
+    chat-wide hole never makes a topic re-read its own history.
     """
-    key = _peer_key(peer_id)
+    peer, thread, key = _mark_key(peer_id, thread_id)
     with _LOCK:
         mark = _load_unlocked().get(key)
         mark = dict(mark) if mark is not None else _empty_mark()
     pending_from = mark["pending_from_id"]
     return {
-        "peer_id": key,
+        "peer_id": peer,
+        "thread_id": thread,
         "min_id": mark["contiguous"],
         "max_id": pending_from,
         "has_hole": pending_from is not None,
@@ -343,14 +500,17 @@ def resume_bounds(peer_id: str | int) -> dict[str, Any]:
     }
 
 
-def forget_mark(peer_id: str | int) -> bool:
-    """Drop one chat's mark; ``True`` if it existed.
+def forget_mark(peer_id: str | int, thread_id: Any = None) -> bool:
+    """Drop one scope's mark; ``True`` if it existed.
 
     Prevents a stale mark from outliving the chat it describes — a mark left
     behind by a mis-keyed or deleted target would otherwise make the next
-    digest of a chat that reuses the id answer "nothing is new".
+    digest of a chat that reuses the id answer "nothing is new". Only the named
+    scope goes: forgetting one topic leaves the chat-wide mark and the sibling
+    topics alone, because a caller that wanted the chat reset can name it
+    without a thread.
     """
-    key = _peer_key(peer_id)
+    _, _, key = _mark_key(peer_id, thread_id)
     with _LOCK:
         marks = dict(_load_unlocked())
         existed = marks.pop(key, None) is not None
@@ -363,8 +523,9 @@ def forget_all() -> int:
     """Drop every mark and return how many were dropped.
 
     Prevents a wholesale reset from being a partial one: the count returned is
-    the number of chats that were actually forgotten, so a caller can tell an
-    empty store from a failed clear.
+    the number of scopes that were actually forgotten — every topic counts, so
+    the number is marks, not chats — and a caller can tell an empty store from
+    a failed clear.
     """
     with _LOCK:
         marks = dict(_load_unlocked())
