@@ -356,8 +356,10 @@ Install prompts for the three required variables and writes them to `<hermes hom
 **Installing `telethon` is a required manual step.** Hermes validates and *surfaces* a plugin's declared `python_dependencies` but never installs them — the field is annotated "validated and surfaced only" in `hermes_cli/plugins_manifest.py`. Install it into Hermes' own venv, not the system Python:
 
 ```bash
-<hermes home>/hermes-agent/venv/bin/python -m pip install -r requirements.txt
+<hermes home>/hermes-agent/venv/bin/python -m pip install 'telethon>=1.44,<2'
 ```
+
+That is exactly what `requirements.txt` contains; naming the requirement instead of the file avoids assuming where the plugin was installed.
 
 `hermes plugins doctor` warns until this is done (it reported the same warning on this machine, where the plugin loads but telethon is absent). Repeat it after `hermes update`: that rebuilds Hermes' venv from its own lock and strips anything not in it, so a manually installed package does not survive on its own.
 
