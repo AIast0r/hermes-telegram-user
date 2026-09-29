@@ -4,7 +4,7 @@ A **self-contained Hermes platform plugin** for controlling Hermes from your own
 
 No external MCP server is required. The plugin owns its Telegram bridge, read tools, folder/unread logic, media retrieval, voice transcript cache, aliases, sanitization, and Telegram rate-limit protection.
 
-Current plugin version: **0.10.0**.
+Current plugin version: **0.11.0**.
 
 ## Core UX: `.h` inside Telegram
 
@@ -49,7 +49,7 @@ Photos/files/voice notes are placed in Hermes' normal media cache. `MessageType.
 
 ## Telegram tools
 
-Version 0.10.0 exposes **34 tools** under the `telegram_user` toolset.
+Version 0.11.0 exposes **34 tools** under the `telegram_user` toolset.
 
 ### Chats/history/search
 
@@ -351,7 +351,16 @@ hermes plugins install AIast0r/hermes-telegram-user --enable
 
 The repository is private, so GitHub credentials must be available non-interactively to Hermes (`gh auth login`, `GITHUB_TOKEN`, `GH_TOKEN`, or your git credential helper).
 
-Install prompts for the three required variables and writes them to `<hermes home>/.env`; Hermes loads that file into the environment at gateway startup.
+Install prompts for the two values it cannot work them out for itself — API ID and API hash — and writes them to `<hermes home>/.env`; Hermes loads that file into the environment at gateway startup.
+
+The session is deliberately **not** prompted for. Nobody can type a StringSession, and asking for one during install is exactly how a placeholder ends up in that file. It is produced by the login command, which runs Telegram's real interactive flow in your terminal:
+
+```bash
+hermes telegram-user login     # phone number, then the code Telegram sends, then 2FA if set
+hermes gateway restart
+```
+
+That is the only step that cannot be unattended: Telegram delivers the code to your own app, and the gateway runs without a terminal to type it into. Everything after it is hands-off.
 
 **The dependency may need installing by hand.** Hermes takes a plugin's declared `python_dependencies` as a declaration and validates it, and some builds install them on `plugins install`/`enable` or after `update`; the build this was tested against (0.21.3) does not — its manifest field is annotated "validated and surfaced only", and `hermes plugins doctor` says so outright:
 

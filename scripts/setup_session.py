@@ -1,26 +1,26 @@
-"""Interactive helper that prints a Telethon StringSession.
+"""Standalone login, for when you would rather not drive Hermes' CLI.
 
-Run outside Hermes:
-    HERMES_TG_USER_API_ID=... HERMES_TG_USER_API_HASH=... python scripts/setup_session.py
+Normally you run the same thing through Hermes itself:
+
+    hermes telegram-user login
+
+This wrapper exists for the cases where that is inconvenient — a different
+machine, or before the plugin is registered. Both share one implementation in
+``core/login.py``.
+
+    <hermes home>/hermes-agent/venv/bin/python scripts/setup_session.py
 """
+
 from __future__ import annotations
 
-import asyncio
-import os
+import sys
+from pathlib import Path
 
+# Running a script sets sys.path[0] to scripts/, so the package root has to be
+# added before core.* resolves.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-async def main() -> None:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-
-    api_id = int(os.environ["HERMES_TG_USER_API_ID"])
-    api_hash = os.environ["HERMES_TG_USER_API_HASH"]
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.start()
-    print("\nHERMES_TG_USER_SESSION=")
-    print(client.session.save())
-    await client.disconnect()
-
+from core.login import run_login  # noqa: E402  (after the path fix above)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(run_login())

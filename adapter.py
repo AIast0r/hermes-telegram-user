@@ -514,7 +514,6 @@ def register(ctx):
         required_env=[
             "HERMES_TG_USER_API_ID",
             "HERMES_TG_USER_API_HASH",
-            "HERMES_TG_USER_SESSION",
         ],
         install_hint="pip install telethon",
         env_enablement_fn=_env_enablement,
@@ -530,3 +529,22 @@ def register(ctx):
         emoji="🟦",
         pii_safe=False,
     )
+
+    # `hermes telegram-user login`: the one-time interactive login belongs on the
+    # CLI, not in a script beside the plugin, because Telegram delivers the code to
+    # the account owner's app and the gateway has no terminal to type it into.
+    # Guarded: an older Hermes without the hook simply does not get the command.
+    register_cli_command = getattr(ctx, "register_cli_command", None)
+    if callable(register_cli_command):
+        from .cli import login_command, register_cli
+
+        register_cli_command(
+            name="telegram-user",
+            help="Telegram user-account bridge: log in and store the session",
+            setup_fn=register_cli,
+            handler_fn=login_command,
+            description=(
+                "Log in once to the Telegram account this plugin bridges, so Hermes can work "
+                "from it. Run `hermes telegram-user login`, then restart the gateway."
+            ),
+        )
