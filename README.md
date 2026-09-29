@@ -206,6 +206,8 @@ It is a real `.md` file, next to the rest of the state:
 
 so you can open it in an editor and rewrite it — the next read picks the change up, no restart. `tg_read_collection` hands it back as `instructions` together with the messages, and the tool tells the model to follow its structure exactly rather than to merely take it into account.
 
+It is returned on **every** read of that collection, so it is part of the context cost each time: keep it a focused skeleton, not prose. The ceiling is 20000 characters, which is room for sections and rules, not for a novel.
+
 The workflow that split implies:
 
 ```text

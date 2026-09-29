@@ -266,6 +266,45 @@ def test_a_hand_edited_template_is_picked_up_without_a_restart():
         assert store.list_collections()[0]["has_brief"] is True
 
 
+_SKELETON = """# Саммари: Работа
+
+## Решения
+Одна строка на решение: что решили · кто владелец · к какому сроку.
+
+## Требует меня
+Только то, что без меня не двинется.
+
+## Ссылки
+Сообщения, к которым придётся вернуться.
+"""
+
+
+def test_a_multi_line_skeleton_round_trips_byte_identical():
+    """The property the whole file move exists for.
+
+    ``sanitize_text`` keeps single newlines and only collapses runs of four or
+    more, so a skeleton must survive unchanged. A regression there -- swapping in
+    ``sanitize_name``, say -- would flatten every template into one paragraph,
+    and nothing else in the suite would notice.
+    """
+    with isolated_state():
+        store = _store()
+        store.save_collection("C", members=[_row(111)])
+        store.set_collection_brief("C", _SKELETON)
+        assert store.get_collection("C")["brief"] == _SKELETON
+
+        # ...and through a save that never mentions the template
+        store.save_collection("C", members=[_row(222)], replace=True)
+        stored = store.get_collection("C")["brief"]
+        assert stored == _SKELETON
+        assert stored.count("\n\n") == 3, "blank lines between sections must survive"
+        assert [line for line in stored.splitlines() if line.startswith("##")] == [
+            "## Решения",
+            "## Требует меня",
+            "## Ссылки",
+        ]
+
+
 def test_deleting_a_collection_removes_its_template():
     with isolated_state():
         store = _store()

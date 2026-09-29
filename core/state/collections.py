@@ -28,10 +28,14 @@ Three things a naive store gets wrong, and this one does not:
 * **a row without a peer id, or with an unusable thread, is not a member.** It
   can never be resolved by id, so it is refused rather than stored, where it
   would masquerade as a chat that has disappeared from the account.
-* **the brief is part of the collection, not of a save.** A caller that does
-  not mention it leaves whatever was stored untouched, so replacing the members
-  of a studied collection cannot silently discard the summary written for it;
-  only an explicit string -- ``""`` included -- replaces it.
+* **the template is a separate file, and is deliberately not cached.** It lives
+  at ``<state dir>/templates/<slug>-<digest>.md`` rather than inside the JSON,
+  because its owner has to be able to rewrite a markdown skeleton in an editor.
+  Membership is cached in memory; the template is not, so every read goes to the
+  file and an edit takes effect without restarting the process. A save that does
+  not mention it leaves it untouched, so replacing the members of a studied
+  collection cannot silently discard the template written for it; only an
+  explicit string -- ``""`` included -- replaces it.
 
 The name is a key, not an identifier: it is normalized with NFKC and casefolded
 (so ``Work`` and ``ｗｏｒｋ`` are one collection), which also means renaming a
