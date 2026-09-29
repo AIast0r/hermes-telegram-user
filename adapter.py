@@ -8,10 +8,10 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult, utf16_len
 from gateway.platforms.event import MessageEvent, MessageType
 
-from .shared import disconnect_client, entity_label, get_client
-from .telegram_limits import telegram_error_message
-from .telegram_media import cache_message_media, media_info
-from .telegram_sanitize import sanitize_name, sanitize_structure, sanitize_text
+from .core.client import disconnect_client, entity_label, get_client
+from .core.limits import telegram_error_message
+from .core.media import cache_message_media, media_info
+from .core.sanitize import sanitize_name, sanitize_structure, sanitize_text
 
 logger = logging.getLogger(__name__)
 

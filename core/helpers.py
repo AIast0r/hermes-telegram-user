@@ -4,10 +4,10 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from .shared import entity_label, utc_iso
-from .telegram_aliases import aliases_for_peer, get_alias
-from .telegram_media import media_info
-from .telegram_sanitize import sanitize_name, sanitize_structure, sanitize_text
+from .client import entity_label, utc_iso
+from .state.aliases import aliases_for_peer, get_alias
+from .media import media_info
+from .sanitize import sanitize_name, sanitize_structure, sanitize_text
 
 
 def parse_dt(raw: Optional[str]) -> Optional[datetime]:
@@ -232,7 +232,7 @@ def message_to_dict(message: Any, *, chat: Any = None) -> dict[str, Any]:
 
     if attachment and attachment.get("kind") in {"voice", "audio"} and chat_id:
         try:
-            from .telegram_transcripts import get_cached_transcript
+            from .state.transcripts import get_cached_transcript
 
             cached = get_cached_transcript(chat_id, int(message.id))
         except Exception:
@@ -362,6 +362,16 @@ def media_filter(kind: str):
         "file": "InputMessagesFilterDocument",
         "gif": "InputMessagesFilterGif",
         "video_note": "InputMessagesFilterRoundVideo",
+        # Filters whose matching rows are not attachments; see TEXT_FILTER_KINDS.
+        "url": "InputMessagesFilterUrl",
+        "link": "InputMessagesFilterUrl",
+        "mentions": "InputMessagesFilterMentions",
+        "my_mentions": "InputMessagesFilterMyMentions",
+        "chat_photos": "InputMessagesFilterChatPhotos",
+        "contacts": "InputMessagesFilterContacts",
+        "geo": "InputMessagesFilterGeo",
+        "phone_calls": "InputMessagesFilterPhoneCalls",
+        "round_voice": "InputMessagesFilterRoundVoice",
     }
     cls_name = names.get(normalized)
     if cls_name is None:
@@ -372,6 +382,29 @@ def media_filter(kind: str):
             f"media filter is unavailable in this Telethon version: {sanitize_name(kind, limit=64)}"
         )
     return cls()
+
+
+# Filters whose matched rows carry no `message.media`: a URL lives in
+# `message.entities`, mentions/pins are plain text, chat photos and contacts are
+# service-ish rows. Callers that filter rows by `media_info(message)` must skip
+# that test for these kinds or every row is dropped.
+TEXT_FILTER_KINDS = frozenset(
+    {
+        "url",
+        "link",
+        "mentions",
+        "my_mentions",
+        "chat_photos",
+        "contacts",
+        "geo",
+        "phone_calls",
+    }
+)
+
+
+def kind_has_media_payload(kind: str) -> bool:
+    """False when the row filter must not require a downloadable attachment."""
+    return (kind or "").strip().lower() not in TEXT_FILTER_KINDS
 
 
 def configured_media_limit_bytes() -> int:

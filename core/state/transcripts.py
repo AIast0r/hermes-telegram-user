@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
-from .telegram_sanitize import sanitize_text
-from .telegram_state import private_file, state_dir
+from ..sanitize import sanitize_text
+from .paths import private_file, state_dir
 
 _DB_LOCK = threading.RLock()
 _KEY_LOCKS_LOCK = threading.Lock()

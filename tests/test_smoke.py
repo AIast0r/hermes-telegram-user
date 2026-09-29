@@ -1,6 +1,24 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+PACKAGE_DIRS = ("core", "scripts")
+
+
+def _package_sources() -> list[Path]:
+    """Python files shipped with the plugin: root modules plus core/ and scripts/.
+
+    Deliberately an allowlist rather than a denylist: tests/, study material under
+    other/ and caches can never leak into the compile and read-only contract checks.
+    """
+    sources = list(ROOT.glob("*.py"))
+    for name in PACKAGE_DIRS:
+        base = ROOT / name
+        if base.is_dir():
+            sources.extend(base.rglob("*.py"))
+    return sorted(p for p in sources if "__pycache__" not in p.relative_to(ROOT).parts)
 
 
 def test_required_files_exist():
@@ -8,16 +26,19 @@ def test_required_files_exist():
         "plugin.yaml",
         "adapter.py",
         "tools.py",
-        "shared.py",
-        "telegram_helpers.py",
-        "telegram_folders.py",
-        "telegram_media.py",
-        "telegram_sanitize.py",
-        "telegram_limits.py",
-        "telegram_state.py",
-        "telegram_aliases.py",
-        "telegram_transcripts.py",
-        "setup_session.py",
+        "core/archive.py",
+        "core/client.py",
+        "core/folders.py",
+        "core/helpers.py",
+        "core/limits.py",
+        "core/media.py",
+        "core/sanitize.py",
+        "core/state/aliases.py",
+        "core/state/archive.py",
+        "core/state/paths.py",
+        "core/state/transcripts.py",
+        "core/state/watermarks.py",
+        "scripts/setup_session.py",
         "README.md",
     ):
         assert (ROOT / name).exists()
@@ -29,7 +50,7 @@ def test_no_core_patch_files():
 
 
 def test_python_sources_compile():
-    for path in ROOT.glob("*.py"):
+    for path in _package_sources():
         compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
 
@@ -57,12 +78,21 @@ def test_adapter_uses_current_hermes_event_surface():
     assert "sanitize_text" in source
 
 
-def test_v040_tool_surface_has_17_selected_tools():
+def test_tool_surface_matches_manifest():
+    """plugin.yaml is the published contract; tools.py must register exactly that set."""
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
-    assert "version: 0.4.0" in manifest
-    tools = [line.strip()[2:] for line in manifest.splitlines() if line.strip().startswith("- tg_")]
-    assert len(tools) == 17
-    assert len(set(tools)) == 17
+    source = (ROOT / "tools.py").read_text(encoding="utf-8")
+    assert "version: 0.5.0" in manifest
+    published = [
+        line.strip()[2:] for line in manifest.splitlines() if line.strip().startswith("- tg_")
+    ]
+    assert len(published) == 28
+    assert len(set(published)) == 28
+    registered = set(re.findall(r'^ {8}"(tg_[a-z_]+)",$', source, re.MULTILINE))
+    assert registered == set(published), (
+        f"manifest-only: {sorted(set(published) - registered)}; "
+        f"code-only: {sorted(registered - set(published))}"
+    )
     for tool in (
         "tg_get_message_context",
         "tg_search_global",
@@ -77,8 +107,19 @@ def test_v040_tool_surface_has_17_selected_tools():
         "tg_set_alias",
         "tg_list_aliases",
         "tg_delete_alias",
+        "tg_get_pinned",
+        "tg_get_drafts",
+        "tg_get_scheduled",
+        "tg_get_profile",
+        "tg_get_sessions",
+        "tg_archive_sync",
+        "tg_archive_search",
+        "tg_archive_status",
+        "tg_archive_forget",
+        "tg_list_digest_marks",
+        "tg_forget_digest_marks",
     ):
-        assert tool in tools
+        assert tool in published
 
 
 def test_no_model_facing_telegram_write_tools_or_read_receipts():
@@ -90,25 +131,25 @@ def test_no_model_facing_telegram_write_tools_or_read_receipts():
         '"tg_mark_read"',
     ):
         assert forbidden not in tools
-    all_source = "\n".join(path.read_text(encoding="utf-8") for path in ROOT.glob("*.py"))
+    all_source = "\n".join(path.read_text(encoding="utf-8") for path in _package_sources())
     assert "send_read_acknowledge(" not in all_source
     assert "mark_read(" not in all_source
 
 
 def test_floodwait_and_single_instance_guards_are_wired():
-    limits = (ROOT / "telegram_limits.py").read_text(encoding="utf-8")
-    shared = (ROOT / "shared.py").read_text(encoding="utf-8")
+    limits = (ROOT / "core" / "limits.py").read_text(encoding="utf-8")
+    client = (ROOT / "core" / "client.py").read_text(encoding="utf-8")
     assert "TelegramRateLimited" in limits
     assert "note_flood_wait" in limits
     assert "threading.BoundedSemaphore" in limits
     assert "acquire_gateway_session_lock" in limits
-    assert "flood_sleep_threshold=configured_flood_sleep_threshold()" in shared
-    assert "async with tool_gate()" in shared
+    assert "flood_sleep_threshold=configured_flood_sleep_threshold()" in client
+    assert "async with tool_gate()" in client
 
 
 def test_voice_cache_uses_native_hermes_stt():
     tools = (ROOT / "tools.py").read_text(encoding="utf-8")
-    transcripts = (ROOT / "telegram_transcripts.py").read_text(encoding="utf-8")
+    transcripts = (ROOT / "core" / "state" / "transcripts.py").read_text(encoding="utf-8")
     assert "from tools.transcription_tools import transcribe_audio" in tools
     assert "tg_transcribe_voice" in tools
     assert "CREATE TABLE IF NOT EXISTS transcripts" in transcripts
@@ -117,8 +158,8 @@ def test_voice_cache_uses_native_hermes_stt():
 
 def test_sanitizer_strips_bidi_override_but_keeps_emoji_joiners():
     namespace = {}
-    source = (ROOT / "telegram_sanitize.py").read_text(encoding="utf-8")
-    exec(compile(source, "telegram_sanitize.py", "exec"), namespace)
+    source = (ROOT / "core" / "sanitize.py").read_text(encoding="utf-8")
+    exec(compile(source, "core/sanitize.py", "exec"), namespace)
     sanitize_text = namespace["sanitize_text"]
     assert sanitize_text("a\u202eb") == "ab"
     assert sanitize_text("👨‍💻") == "👨‍💻"

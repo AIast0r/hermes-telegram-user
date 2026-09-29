@@ -4,7 +4,7 @@ A **self-contained Hermes platform plugin** for controlling Hermes from your own
 
 No external MCP server is required. The plugin owns its Telegram bridge, read tools, folder/unread logic, media retrieval, voice transcript cache, aliases, sanitization, and Telegram rate-limit protection.
 
-Current plugin version: **0.4.0**.
+Current plugin version: **0.5.0**.
 
 ## Core UX: `.h` inside Telegram
 
@@ -49,7 +49,7 @@ Photos/files/voice notes are placed in Hermes' normal media cache. `MessageType.
 
 ## Telegram tools
 
-Version 0.4.0 exposes **17 tools** under the `telegram_user` toolset.
+Version 0.5.0 exposes **28 tools** under the `telegram_user` toolset.
 
 ### Chats/history/search
 
@@ -135,6 +135,53 @@ Aliases are stored locally in:
 ```
 
 Alias operations modify only the plugin's local state. They do not edit Telegram contacts and never store phone numbers.
+
+### Pinned, drafts, scheduled
+
+- `tg_get_pinned` — a chat's (or forum topic's) pinned messages.
+- `tg_get_drafts` — every unsent draft in the account, newest first. Reading them does not clear them.
+- `tg_get_scheduled` — a chat's scheduled (not yet sent) messages. A message set to "send when online" comes back as `send_when_online: true` rather than as a 19 January 2038 date, and its id is marked `id_namespace: "scheduled"` because scheduled messages have their own id sequence.
+
+`tg_participants` also takes `role` (`all`, `admins`, `banned`, `bots`, `recent`), and `tg_search_media` additionally accepts the kinds `url` (shared links), `mentions`, `my_mentions`, `chat_photos`, `contacts`, `geo` and `phone_calls`.
+
+### Profile and sessions
+
+- `tg_get_profile` — a user's bio, birthday, personal channel, premium/verified/scam flags, last-seen bucket and common-chat count; optionally the shared chats. Phone numbers are never returned, only a `phone_present` flag.
+- `tg_get_sessions` — the devices the account is signed in on: device, app, coarse country/region, a truncated network (`a.b.0.0` / `2001:db8::`), first and last activity, and unconfirmed flags. Read-only: it cannot end a session.
+
+### Local archive and offline search
+
+`кто за последние полгода говорил про P40?` should not re-read Telegram every time. The plugin can copy history into a local SQLite archive and answer from it:
+
+- `tg_archive_sync` — copy one chat's history into the archive. Resumable: a long backfill continues on the next call, and an interrupted run records the gap it left so the next sync closes it before taking anything newer.
+- `tg_archive_search` — substring search over the archive, optionally limited to one chat and a time window. **No Telegram traffic at all.**
+- `tg_archive_status` — archive path, size, per-chat message counts, and whether a chat is fully copied or still holds a gap.
+- `tg_archive_forget` — drop one chat from the archive.
+
+```text
+~/.hermes/state/telegram-user/archive.sqlite3
+```
+
+An edited message **replaces** its stored row, so the archive is a copy of what Telegram holds now, not a log of every version. Nothing is written to Telegram and no read pointer moves.
+
+### Digest watermarks
+
+Watermarks remember how far a chat has already been digested, so a later summary can ask for what is new only:
+
+- `tg_read_messages` takes `since_last_digest` — return only what arrived after this chat's last digest, and advance the mark.
+- `tg_list_digest_marks` / `tg_forget_digest_marks` — inspect or clear the marks.
+
+```text
+~/.hermes/state/telegram-user/digest_watermarks.json
+```
+
+The rules that keep this safe:
+
+- a mark is keyed by Telegram **peer id**, never by chat name;
+- the mark only advances when a walk provably reached the previous mark;
+- a walk cut short by the page limit records a gap and does **not** advance, so a truncated run can never silently skip messages;
+- the next walk closes that gap before taking newer traffic;
+- `since_last_digest` refuses to combine with `since`/`until`/`topic`, because a filtered walk cannot prove it reached the mark.
 
 ## Telegram FloodWait/rate-limit protection
 
@@ -236,7 +283,7 @@ pip install -r ~/.hermes/plugins/platforms/telegram-user/requirements.txt
 cd ~/.hermes/plugins/platforms/telegram-user
 export HERMES_TG_USER_API_ID='123456'
 export HERMES_TG_USER_API_HASH='...'
-python setup_session.py
+python scripts/setup_session.py
 ```
 
 Store the printed `HERMES_TG_USER_SESSION` securely.
@@ -288,10 +335,31 @@ hermes tools enable telegram_user --platform telegram
 
 or configure it with Hermes' normal `platform_toolsets` settings.
 
+## Tests
+
+The suite is offline: it never contacts Telegram and never needs `telethon`.
+
+```bash
+python -m pytest tests/ -q
+```
+
+- `tests/test_smoke.py` — source-level contract checks: the tool surface matches
+  `plugin.yaml` exactly (names, count, version), the read-only guarantees hold,
+  and the rate-limit/single-instance wiring is present.
+- `tests/test_state_archive.py` — the archive storage and search layer.
+- `tests/test_watermarks.py` — mark monotonicity and the gap-aware advance rule.
+- `tests/test_tools_offline.py` — tool registration, every handler that can
+  refuse bad input without touching Telegram, and the digest advance rule.
+
+`pytest` is not listed in `requirements.txt`; install it separately.
+
 ## Current limitations
 
 - One active `.h` request per Telegram chat is still assumed. A second `.h` before the first finishes can replace the pending edit target.
 - Telegram rate limits are dynamic; the local limiter reduces risk but cannot guarantee that Telegram never returns FloodWait.
 - Transcript caching applies to `tg_transcribe_voice`; Hermes' central automatic STT for a live `.h` voice/reply has its own runtime path.
 - Aliases are exact local mappings; the plugin intentionally does not fuzzy-guess a different person.
+- `since_last_digest` is wired into `tg_read_messages`. `tg_get_unread` and `tg_read_folder` still read whole windows.
+- The archive stores text and metadata, not attachment bytes, and it does not track deletions — a message deleted in Telegram stays in the archive until the chat is re-synced or dropped with `tg_archive_forget`.
+- `tg_archive_sync` does not hold a global lock, so two concurrent syncs of the same chat can interleave. They converge, but the reported counts may overlap.
 - No external MCP is required and no Hermes core patch is required.

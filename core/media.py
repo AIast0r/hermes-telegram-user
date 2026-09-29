@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .telegram_sanitize import sanitize_name, sanitize_text
+from .sanitize import sanitize_name, sanitize_text
 
 
 _MIME_FALLBACKS = {

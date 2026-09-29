@@ -6,14 +6,14 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
-from .telegram_limits import (
+from .limits import (
     acquire_gateway_session_lock,
     configured_flood_sleep_threshold,
     release_gateway_session_lock,
     telegram_error_message,
     tool_gate,
 )
-from .telegram_sanitize import sanitize_name
+from .sanitize import sanitize_name
 
 # The gateway adapter owns this long-lived client. Tool calls intentionally do NOT
 # reuse it: current Hermes may execute async tool handlers on a fresh worker event

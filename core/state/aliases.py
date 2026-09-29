@@ -7,8 +7,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
-from .telegram_sanitize import sanitize_name
-from .telegram_state import private_file, state_dir
+from ..sanitize import sanitize_name
+from .paths import private_file, state_dir
 
 _LOCK = threading.RLock()
 _CACHE: Optional[dict[str, dict[str, Any]]] = None

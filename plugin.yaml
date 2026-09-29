@@ -1,8 +1,8 @@
 name: telegram-user
 label: Telegram User (MTProto)
 kind: platform
-version: 0.4.0
-description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, cached voice STT, aliases, rate-limit protection, media retrieval, contacts and participants. No external MCP required.
+version: 0.5.0
+description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, cached voice STT, aliases, rate-limit protection, media retrieval, contacts, participants, pinned/draft/scheduled surfaces, profile and session diagnostics, and a resumable local archive with offline search. No external MCP required.
 author: community
 requires_env:
   - name: HERMES_TG_USER_API_ID
@@ -64,3 +64,14 @@ provides_tools:
   - tg_set_alias
   - tg_list_aliases
   - tg_delete_alias
+  - tg_get_pinned
+  - tg_get_drafts
+  - tg_get_scheduled
+  - tg_get_profile
+  - tg_get_sessions
+  - tg_archive_sync
+  - tg_archive_search
+  - tg_archive_status
+  - tg_archive_forget
+  - tg_list_digest_marks
+  - tg_forget_digest_marks

@@ -1,7 +1,7 @@
 """Interactive helper that prints a Telethon StringSession.
 
 Run outside Hermes:
-    HERMES_TG_USER_API_ID=... HERMES_TG_USER_API_HASH=... python setup_session.py
+    HERMES_TG_USER_API_ID=... HERMES_TG_USER_API_HASH=... python scripts/setup_session.py
 """
 from __future__ import annotations
 

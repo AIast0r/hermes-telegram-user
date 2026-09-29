@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .shared import entity_label
-from .telegram_aliases import aliases_for_peer
-from .telegram_sanitize import sanitize_name
+from .client import entity_label
+from .state.aliases import aliases_for_peer
+from .sanitize import sanitize_name
 
 
 @dataclass(frozen=True)
