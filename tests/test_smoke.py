@@ -85,12 +85,12 @@ def test_tool_surface_matches_manifest():
     """plugin.yaml is the published contract; tools.py must register exactly that set."""
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     source = (ROOT / "tools.py").read_text(encoding="utf-8")
-    assert "version: 0.7.0" in manifest
+    assert "version: 0.8.0" in manifest
     published = [
         line.strip()[2:] for line in manifest.splitlines() if line.strip().startswith("- tg_")
     ]
-    assert len(published) == 33
-    assert len(set(published)) == 33
+    assert len(published) == 34
+    assert len(set(published)) == 34
     row_names = re.findall(r'^ {8}"(tg_[a-z_]+)",$', source, re.MULTILINE)
     registered = set(row_names)
     assert registered == set(published), (
@@ -131,6 +131,7 @@ def test_tool_surface_matches_manifest():
         "tg_mark_summarized",
         "tg_save_collection",
         "tg_list_collections",
+        "tg_set_collection_brief",
         "tg_delete_collection",
         "tg_read_collection",
     ):

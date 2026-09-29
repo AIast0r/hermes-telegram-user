@@ -116,6 +116,31 @@ def test_marks_are_isolated_per_peer():
         assert marks.get_mark(OTHER)["contiguous"] == 20
 
 
+def test_a_thread_mark_never_inherits_the_chat_mark():
+    """A thread read must not be floored at a chat-wide mark it never reached.
+
+    If it were, messages that arrived only in that thread would sit below the
+    floor and never be digested — silently, and with no way to notice.
+    """
+    with isolated_state():
+        marks = _marks()
+        marks.set_mark(PEER, contiguous=900)
+
+        assert marks.get_mark(PEER, "7") is None
+        bounds = marks.resume_bounds(PEER, "7")
+        assert bounds["min_id"] == 0, "a thread with no mark of its own starts clean"
+        assert bounds["contiguous"] == 0
+        assert bounds["has_hole"] is False
+
+        marks.set_mark(PEER, contiguous=10, thread_id="7")
+        assert marks.get_mark(PEER)["contiguous"] == 900, "the chat mark must not move"
+        assert marks.get_mark(PEER, "7")["contiguous"] == 10
+
+        # ...and the reverse direction holds too: advancing the chat leaves the thread alone
+        marks.set_mark(PEER, contiguous=1500)
+        assert marks.get_mark(PEER, "7")["contiguous"] == 10
+
+
 def test_forget_all_clears_every_mark():
     with isolated_state():
         marks = _marks()

@@ -140,15 +140,137 @@ def test_a_corrupt_file_degrades_to_empty():
         assert store.get_collection("anything") is None
 
 
+def _thread_row(peer_id, thread, name="Someone"):
+    return {"peer_id": str(peer_id), "name": name, "username": None, "thread": str(thread)}
+
+
+def test_a_chat_can_appear_once_whole_and_once_per_thread():
+    with isolated_state():
+        store = _store()
+        saved = store.save_collection(
+            "C", members=[_row(111, "Whole chat"), _thread_row(111, 7, "Releases")]
+        )
+        scopes = sorted((row["peer_id"], row["thread"] or "") for row in saved["members"])
+        assert scopes == [("111", ""), ("111", "7")]
+
+
+def test_a_whole_chat_exclude_drops_its_threads_too():
+    with isolated_state():
+        store = _store()
+        saved = store.save_collection(
+            "C",
+            members=[_row(111, "Whole chat"), _thread_row(111, 7, "Releases")],
+            exclude=[_row(111, "Noisy")],
+        )
+        assert saved["members"] == []
+
+
+def test_a_thread_exclude_drops_only_that_thread():
+    with isolated_state():
+        store = _store()
+        saved = store.save_collection(
+            "C",
+            members=[_row(111, "Whole chat"), _thread_row(111, 7, "Releases")],
+            exclude=[_thread_row(111, 7, "Releases")],
+        )
+        assert [(row["peer_id"], row["thread"]) for row in saved["members"]] == [("111", None)]
+
+
+def test_thread_ids_are_canonicalised_and_validated():
+    with isolated_state():
+        store = _store()
+        saved = store.save_collection("C", members=[_thread_row(111, "007")])
+        assert saved["members"][0]["thread"] == "7"
+
+        for bad in (True, 0, -3, "later", ""):
+            try:
+                store.save_collection("D", members=[_thread_row(111, bad)])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"expected ValueError for thread {bad!r}")
+
+
+def test_a_standing_brief_travels_with_the_collection():
+    with isolated_state():
+        store = _store()
+        saved = store.save_collection("C", members=[_row(111)])
+        assert saved["brief"] == ""
+
+        store.save_collection("C", members=[_row(111)], brief="Кратко: кто, что, решение.")
+        assert store.get_collection("C")["brief"] == "Кратко: кто, что, решение."
+        assert store.list_collections()[0]["has_brief"] is True
+        assert "brief" not in store.list_collections()[0], "the text stays out of the list"
+
+
+def test_the_brief_survives_a_member_overwrite_when_omitted():
+    """Re-saving members must not silently drop the template the agent wrote."""
+    with isolated_state():
+        store = _store()
+        store.save_collection("C", members=[_row(111)], brief="template")
+        store.save_collection("C", members=[_row(222)], replace=True)
+        row = store.get_collection("C")
+        assert [r["peer_id"] for r in row["members"]] == ["222"]
+        assert row["brief"] == "template"
+
+
+def test_the_brief_can_be_replaced_and_cleared():
+    with isolated_state():
+        store = _store()
+        store.save_collection("C", members=[_row(111)], brief="first")
+        store.save_collection("C", members=[_row(111)], brief="second")
+        assert store.get_collection("C")["brief"] == "second"
+        store.save_collection("C", members=[_row(111)], brief="")
+        assert store.get_collection("C")["brief"] == ""
+        assert store.list_collections()[0]["has_brief"] is False
+
+
+def test_the_brief_is_bounded_and_masked():
+    with isolated_state():
+        store = _store()
+        row = store.save_collection("C", members=[_row(111)], brief="a" * 9000)
+        # sanitize_text truncates to the limit and marks it with an ellipsis
+        assert row["brief"].endswith("…")
+        assert len(row["brief"]) <= 4001
+        masked = store.save_collection("C", members=[_row(111)], brief="x\u202ey")
+        assert masked["brief"] == "xy"
+
+
+def test_writing_the_brief_leaves_members_alone():
+    """The brief has its own writer, so it cannot clobber a concurrent member save."""
+    with isolated_state():
+        store = _store()
+        store.save_collection("C", members=[_row(111)], exclude=[_row(222)])
+        store.set_collection_brief("C", "template")
+
+        row = store.get_collection("C")
+        assert [r["peer_id"] for r in row["members"]] == ["111"]
+        assert [r["peer_id"] for r in row["exclude"]] == ["222"]
+        assert row["brief"] == "template"
+
+        for bad in (5, None, ["x"]):
+            try:
+                store.set_collection_brief("C", bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"a non-text brief must be refused: {bad!r}")
+
+        try:
+            store.set_collection_brief("absent", "x")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an unknown collection must be refused")
+
+
 def test_selection_matches_by_peer_id_not_by_title():
     """A renamed chat must keep resolving; a title is never the key.
 
-    The dialog entities here are deliberately unmarkable, which exercises the
-    documented fallback to ``Dialog.id``. That works whether or not telethon is
-    installed — with it, ``get_peer_id`` raises for an opaque object and the
-    module falls back; without it, the import itself fails and it falls back the
-    same way — so the property is pinned in both worlds instead of behind a
-    branch that only asserts an exception.
+    The dialogs here carry no entity at all, which takes the module's own
+    ``if entity is not None:`` guard straight to the documented fallback on
+    ``Dialog.id``. That is deterministic whether or not telethon is installed —
+    unlike an unmarkable object, which relies on the dependency *raising*.
     """
     import asyncio
 
@@ -169,7 +291,7 @@ def test_selection_matches_by_peer_id_not_by_title():
 
         class Dialog:
             def __init__(self, peer_id, name):
-                self.entity = type("Opaque", (), {"id": peer_id})()
+                self.entity = None
                 self.id = peer_id
                 self.name = name
                 self.dialog = None
@@ -235,6 +357,7 @@ def test_tool_paths_that_need_no_telegram():
 
         for handler, needle in (
             (tools._tg_save_collection, "name is required"),
+            (tools._tg_set_collection_brief, "name is required"),
             (tools._tg_delete_collection, "name is required"),
             (tools._tg_read_collection, "collection is required"),
         ):

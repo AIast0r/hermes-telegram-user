@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _plugin_support import isolated_state, plugin_module  # noqa: E402
 
 EXPECTED_TOOLSET = "telegram_user"
-EXPECTED_TOOL_COUNT = 33
+EXPECTED_TOOL_COUNT = 34
 
 # handler name -> substring the structured error must contain
 GUARDED_HANDLERS = {
@@ -45,6 +45,7 @@ GUARDED_HANDLERS = {
     "_tg_search_media": "global media search requires kind or query",
     "_tg_mark_summarized": "chat is required",
     "_tg_save_collection": "name is required",
+    "_tg_set_collection_brief": "name is required",
     "_tg_delete_collection": "name is required",
     "_tg_read_collection": "collection is required",
 }

@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from .core.archive import ARCHIVE_MAX_SYNC, search_archive, sync_chat
 from .core.client import credentials, entity_label, tool_client, utc_iso
-from .core.collections import describe_collection, select_dialogs
+from .core.collections import describe_collection, select_dialogs, select_scopes
 from .core.folders import (
     dialog_is_muted,
     dialog_summary,
@@ -40,6 +40,7 @@ from .core.state.collections import (
     get_collection,
     list_collections,
     save_collection,
+    set_collection_brief,
 )
 from .core.state.transcripts import (
     get_cached_transcript,
@@ -1318,39 +1319,101 @@ async def _collection_rows(
     return rows, unresolved
 
 
+async def _thread_rows(
+    client: Any, entries: Any
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve ``{"chat": ..., "topic": ...}`` entries to thread-scoped rows."""
+    rows: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    for raw in entries or []:
+        if not isinstance(raw, dict):
+            unresolved.append(sanitize_name(str(raw), limit=128))
+            continue
+        chat = str(raw.get("chat") or "").strip()
+        topic = str(raw.get("topic") or "").strip()
+        label = f"{chat or '?'} / {topic or '?'}"
+        if not chat or not topic:
+            unresolved.append(sanitize_name(label, limit=128))
+            continue
+        try:
+            entity = await resolve_chat(client, chat)
+            thread = int(await find_topic_root(client, entity, topic))
+        except Exception:
+            unresolved.append(sanitize_name(label, limit=128))
+            continue
+        rows.append(
+            {
+                "peer_id": peer_id(entity),
+                "name": entity_label(entity),
+                "username": getattr(entity, "username", None),
+                "thread": str(thread),
+            }
+        )
+    return rows, unresolved
+
+
 async def _tg_save_collection(args: dict[str, Any], **_: Any) -> str:
     name = str(args.get("name") or "").strip()
     if not name:
         return _json({"error": "name is required"})
-    chats = args.get("chats")
-    exclude = args.get("exclude")
-    chats = [] if chats in (None, "") else chats
-    exclude = [] if exclude in (None, "") else exclude
-    if not isinstance(chats, list) or not isinstance(exclude, list):
+    lists = {}
+    for key in ("chats", "threads", "exclude", "exclude_threads"):
+        value = args.get(key)
+        value = [] if value in (None, "") else value
+        if not isinstance(value, list):
+            return _json({"error": f"{key} must be a list"})
+        lists[key] = value
+    if not any(lists.values()) and args.get("brief") is None:
         return _json(
-            {
-                "error": (
-                    "chats and exclude must be lists of chat ids, titles, usernames or aliases"
-                )
-            }
+            {"error": "a collection needs at least one chat, thread or exclude entry"}
         )
-    if not chats and not exclude:
-        return _json({"error": "a collection needs at least one chat or exclude entry"})
     replace = bool(args.get("replace", True))
+    brief = args.get("brief")
     try:
         async with tool_client() as client:
-            members, unresolved_members = await _collection_rows(client, chats)
-            excluded, unresolved_exclude = await _collection_rows(client, exclude)
-        # Exclusion wins, so the store drops any peer that is in both lists.
-        row = save_collection(name, members=members, exclude=excluded, replace=replace)
+            members, unresolved_members = await _collection_rows(client, lists["chats"])
+            threaded, unresolved_threads = await _thread_rows(client, lists["threads"])
+            excluded, unresolved_exclude = await _collection_rows(client, lists["exclude"])
+            excluded_threads, unresolved_exclude_threads = await _thread_rows(
+                client, lists["exclude_threads"]
+            )
+        # Exclusion wins, so the store drops any scope that is in both lists — a
+        # whole-chat exclude also drops that chat's thread rows.
+        kwargs: dict[str, Any] = {}
+        if brief is not None:
+            kwargs["brief"] = str(brief)
+        row = save_collection(
+            name,
+            members=members + threaded,
+            exclude=excluded + excluded_threads,
+            replace=replace,
+            **kwargs,
+        )
         return _json(
             {
                 "saved": True,
                 "collection": row,
-                "unresolved_members": unresolved_members,
-                "unresolved_exclude": unresolved_exclude,
+                "unresolved_members": unresolved_members + unresolved_threads,
+                "unresolved_exclude": unresolved_exclude + unresolved_exclude_threads,
             }
         )
+    except Exception as exc:
+        return _error(exc)
+
+
+async def _tg_set_collection_brief(args: dict[str, Any], **_: Any) -> str:
+    """Attach the agent's own summary template to a collection."""
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return _json({"error": "name is required"})
+    if args.get("brief") is None:
+        return _json({"error": "brief is required"})
+    try:
+        # A dedicated writer, not a read-modify-write of the whole record: a
+        # concurrent tg_save_collection would otherwise lose whichever side
+        # snapshotted first.
+        row = set_collection_brief(name, str(args.get("brief")))
+        return _json({"saved": True, "name": row["name"], "brief": row["brief"]})
     except Exception as exc:
         return _error(exc)
 
@@ -1362,7 +1425,11 @@ async def _tg_list_collections(args: dict[str, Any], **_: Any) -> str:
             rows = list_collections()
             return _json({"count": len(rows), "collections": rows})
         async with tool_client() as client:
-            return _json({"collection": await describe_collection(client, name)})
+            described = await describe_collection(client, name)
+        # The brief is the agent's own template for this scope, so it travels with
+        # the collection instead of being retyped in every prompt.
+        described["brief"] = (get_collection(name) or {}).get("brief", "")
+        return _json({"collection": described})
     except Exception as exc:
         return _error(exc)
 
@@ -1390,25 +1457,33 @@ async def _tg_read_collection(args: dict[str, Any], **_: Any) -> str:
         per_chat = bounded_int(args.get("messages_per_chat"), 50, 1, 500)
         digest = bool(args.get("since_last_digest", False))
         async with tool_client() as client:
-            collection, dialogs = await select_dialogs(client, name)
+            collection, scopes = await select_scopes(client, name)
             chats = []
-            for dialog in dialogs:
+            for dialog, thread in scopes:
                 if unread_only and not dialog_waiting(dialog):
                     continue
                 digest_info = None
                 bounds: dict[str, Any] = {}
                 if digest:
-                    _key, bounds, digest_info = _digest_bounds(dialog.entity)
+                    _key, bounds, digest_info = _digest_bounds(
+                        dialog.entity, str(thread) if thread is not None else None
+                    )
+                extra: dict[str, Any] = dict(bounds)
+                if thread is not None:
+                    # A thread member reads only its own topic.
+                    extra["reply_to"] = thread
                 rows = await _read_messages(
                     client,
                     dialog.entity,
                     limit=per_chat,
                     since=since,
                     until=until,
-                    **bounds,
+                    **extra,
                 )
                 if rows:
                     entry = {**dialog_summary(dialog), "messages": rows}
+                    if thread is not None:
+                        entry["thread_id"] = str(thread)
                     if digest:
                         entry["digest"] = digest_info
                     chats.append(entry)
@@ -1417,7 +1492,9 @@ async def _tg_read_collection(args: dict[str, Any], **_: Any) -> str:
             return _json(
                 {
                     "collection": collection.get("name"),
+                    "brief": collection.get("brief", ""),
                     "member_count": len(collection.get("members") or []),
+                    "scope_count": len(scopes),
                     "chat_count": len(chats),
                     "read_receipts_sent": False,
                     "since_last_digest": digest,
@@ -1447,6 +1524,18 @@ _STRINGS = {
     "type": "array",
     "items": {"type": "string"},
     "description": "Chat ids, titles, usernames or exact saved aliases.",
+}
+_THREADS = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "chat": _CHAT,
+            "topic": {"type": "string", "description": "Forum topic id or title."},
+        },
+        "required": ["chat", "topic"],
+    },
+    "description": "Individual forum threads, one entry per thread.",
 }
 _SINCE = {"type": "string", "description": "ISO datetime, today, or yesterday."}
 _UNTIL = {"type": "string", "description": "Exclusive ISO upper bound."}
@@ -1767,21 +1856,45 @@ _TOOL_DEFS = [
     ),
     (
         "tg_save_collection",
-        "Save a named local set of chats, with an optional exclude list, so a scope can be reused instead of re-listed every time. A chat in both lists is treated as excluded. Only local state changes.",
+        "Save a named local set of chats and/or individual forum threads, with an optional exclude list, so a scope can be reused instead of re-listed every time. A scope in both lists is treated as excluded. Only local state changes.",
         _tg_save_collection,
         _obj(
             {
                 "name": {"type": "string"},
                 "chats": _STRINGS,
+                "threads": _THREADS,
                 "exclude": _STRINGS,
+                "exclude_threads": _THREADS,
+                "brief": {
+                    "type": "string",
+                    "description": (
+                        "Optional standing instruction kept with the collection, e.g. a "
+                        "summary template the agent wrote. Empty string clears it."
+                    ),
+                },
                 "replace": {"type": "boolean"},
             },
             ["name"],
         ),
     ),
     (
+        "tg_set_collection_brief",
+        "Attach a standing instruction to a saved collection — the summary template the agent wrote after studying it. Returned with every read of that collection, so it never has to be sent again. Members are untouched.",
+        _tg_set_collection_brief,
+        _obj(
+            {
+                "name": _COLLECTION,
+                "brief": {
+                    "type": "string",
+                    "description": "The instruction text. Empty string clears it.",
+                },
+            },
+            ["name", "brief"],
+        ),
+    ),
+    (
         "tg_list_collections",
-        "List saved chat collections. With a name, also reports its members, and marks any member that no longer exists in the dialog list.",
+        "List saved chat collections, or show one with its members, their threads, the standing brief and any member that no longer exists in the dialog list.",
         _tg_list_collections,
         _obj({"name": _COLLECTION}),
     ),

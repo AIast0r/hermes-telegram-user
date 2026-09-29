@@ -1,8 +1,8 @@
 name: telegram-user
 label: Telegram User (MTProto)
 kind: platform
-version: 0.7.0
-description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, cached voice STT, aliases, saved chat collections with exclusions, rate-limit protection, media retrieval, contacts, participants, pinned/draft/scheduled surfaces, profile and session diagnostics, and a resumable local archive with offline search. One explicitly scoped tool marks a summarised chat or forum thread as read. No external MCP required.
+version: 0.8.0
+description: Self-contained MTProto user-account bridge for Hermes with .h commands, reply/media context, unread/folder digests, global search, cached voice STT, aliases, saved chat and forum-thread collections with exclusions and a standing brief, rate-limit protection, media retrieval, contacts, participants, pinned/draft/scheduled surfaces, profile and session diagnostics, and a resumable local archive with offline search. One explicitly scoped tool marks a summarised chat or forum thread as read. No external MCP required.
 author: community
 requires_env:
   - name: HERMES_TG_USER_API_ID
@@ -78,5 +78,6 @@ provides_tools:
   - tg_mark_summarized
   - tg_save_collection
   - tg_list_collections
+  - tg_set_collection_brief
   - tg_delete_collection
   - tg_read_collection

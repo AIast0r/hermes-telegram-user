@@ -4,7 +4,7 @@ A **self-contained Hermes platform plugin** for controlling Hermes from your own
 
 No external MCP server is required. The plugin owns its Telegram bridge, read tools, folder/unread logic, media retrieval, voice transcript cache, aliases, sanitization, and Telegram rate-limit protection.
 
-Current plugin version: **0.7.0**.
+Current plugin version: **0.8.0**.
 
 ## Core UX: `.h` inside Telegram
 
@@ -49,7 +49,7 @@ Photos/files/voice notes are placed in Hermes' normal media cache. `MessageType.
 
 ## Telegram tools
 
-Version 0.7.0 exposes **33 tools** under the `telegram_user` toolset.
+Version 0.8.0 exposes **34 tools** under the `telegram_user` toolset.
 
 ### Chats/history/search
 
@@ -166,24 +166,39 @@ An edited message **replaces** its stored row, so the archive is a copy of what 
 
 ### Saved chat collections
 
-Re-listing the same chats every time is noise. A collection is a named local set of chats, with an optional exclude list, that reads can reuse as a scope:
+Re-listing the same chats every time is noise. A collection is a named local set of chats and/or individual forum threads, with an optional exclude list, that reads can reuse as a scope:
 
-- `tg_save_collection` — save or update a collection from chat ids, titles, usernames or aliases. Anything that did not resolve is reported back instead of being dropped silently.
-- `tg_list_collections` — list collections; with a name, show its members and mark any member that no longer exists in the dialog list.
+- `tg_save_collection` — save or update one. `chats` takes whole chats; `threads` takes `{"chat": ..., "topic": ...}` entries, so a collection can hold only those threads. `exclude` / `exclude_threads` remove scopes. Anything that did not resolve is reported back instead of being dropped silently.
+- `tg_set_collection_brief` — attach a standing instruction (see below).
+- `tg_list_collections` — list collections; with a name, show its members, their threads, the brief, and any member that no longer exists in the dialog list.
 - `tg_delete_collection` — delete one.
-- `tg_read_collection` — read a time window across a collection with its exclusions applied, with the same digest bounding as `tg_read_folder`. `tg_get_unread` also takes `collection=`.
-- Exclusions win: a chat in both lists is treated as excluded.
+- `tg_read_collection` — read a time window across the collection with its exclusions applied, with the same digest bounding as `tg_read_folder`. `tg_get_unread` also takes `collection=`.
+
+Exclusions win: an excluded scope is dropped **from this collection only** — it does not stop the plugin reading that chat directly. Excluding a whole chat also drops that chat's thread entries.
 
 ```text
 ~/.hermes/state/telegram-user/collections.json
 ```
 
-Members are stored as Telegram **peer ids**, never titles or usernames — both change, and a renamed chat has to keep resolving. Re-adding a chat or picking up a rename is just `tg_save_collection` again.
+Members are stored as Telegram **peer ids** — plus a topic root id for a thread — never titles or usernames: both change, and a renamed chat has to keep resolving.
+
+#### A standing brief per collection
+
+The plugin supplies data; the summarising is Hermes' job. So a collection can carry a free-text **brief** that the agent gets back with every `tg_read_collection`, instead of retyping its instructions each time.
+
+The workflow that split implies:
 
 ```text
-.h суммаризуй коллекцию Работа
-.h что нового в коллекции Доноры
+1. Hermes studies a folder and builds the collection with tg_save_collection
+   (threads listed too, when only some topics matter).
+2. Hermes reads it with tg_read_collection — reading only, no summarising — and
+   works out what a good summary of this scope looks like.
+3. Hermes stores that template with tg_set_collection_brief.
+4. From then on tg_read_collection returns the brief with the messages, so
+   "суммаризуй коллекцию Работа" behaves the same way every time.
 ```
+
+The plugin never calls a model and never summarises. It stores the instruction and hands it back alongside the data, which keeps the summarising model — and the choice of it — on the Hermes side.
 
 ### Digest watermarks
 
@@ -403,9 +418,11 @@ python -m pytest tests/ -q
   refuse bad input without touching Telegram, and the marking contract
   (badge and mark move together; a refused acknowledgement moves neither).
 - `tests/test_collections.py` — collection storage and the rules that decide a
-  scope: exclusion wins, a merge keeps stored names, resolution is by peer id.
+  scope: exclusion wins (a whole-chat exclusion drops its threads), a merge keeps
+  stored names, the standing brief survives a member overwrite, and resolution is
+  by peer id.
 
-77 tests, all offline. `telethon` is optional: when it is importable the
+87 tests, all offline. `telethon` is optional: when it is importable the
 acknowledgement and selection tests assert against the real request classes and
 peer types, and when it is not they assert the documented fallback behaviour
 instead of passing vacuously.
