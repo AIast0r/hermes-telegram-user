@@ -349,7 +349,7 @@ Recommended:
 hermes plugins install AIast0r/hermes-telegram-user --enable
 ```
 
-The repository is private, so GitHub credentials must be available non-interactively to Hermes (`gh auth login`, `GITHUB_TOKEN`, `GH_TOKEN`, or your git credential helper).
+The repository is public, so the clone needs no credentials. If you fork it and make the fork private, supply a token non-interactively through `GITHUB_TOKEN` or `GH_TOKEN`: Hermes clones plugins with credential helpers and askpass disabled, so `gh auth setup-git` does not help here.
 
 Install prompts for the two values it cannot work them out for itself — API ID and API hash — and writes them to `<hermes home>/.env`; Hermes loads that file into the environment at gateway startup.
 
@@ -376,6 +376,8 @@ So run the install, then check with `hermes plugins doctor telegram-user`. If th
 ```
 
 Repeat it after `hermes update`: that rebuilds Hermes' venv from its own lock and strips anything not in it, so a manually installed package does not survive on its own. Without telethon the plugin still imports and registers — `check_requirements()` returns false, so Hermes simply does not offer the platform or the toolset.
+
+**In the published container there is no venv to write into.** `/opt/hermes` is root-owned and read-only to the runtime user, so the image redirects runtime installs to `/opt/data/lazy-packages` — a directory on the data volume that Hermes appends to `sys.path` at startup. `hermes plugins install --enable` resolves the dependency by itself there, and `hermes plugins doctor telegram-user` shows the same `OK` line either way. That directory is wiped when an image upgrade changes the Python ABI, so after a large update re-run the install to put the dependency back.
 
 Manual installation:
 
@@ -440,11 +442,11 @@ gateway:
 The toolset is `telegram_user`. Enable it only on Hermes surfaces that should be allowed to inspect your personal Telegram account.
 
 ```bash
-hermes tools enable telegram_user --platform cli
-hermes tools enable telegram_user --platform telegram
+hermes tools enable telegram_user --platform telegram_user   # inbound `.h` turns handled by this plugin
+hermes tools enable telegram_user --platform cli             # local CLI/TUI sessions on the same host
 ```
 
-or configure it with Hermes' normal `platform_toolsets` settings.
+The platform key is `telegram_user` — the name the plugin registers with `ctx.register_platform`. Plugin platform names are valid `--platform` targets, so this is what grants tools to sessions that arrive as `.h` over your own account. `--platform telegram` would target Hermes' official Telegram *bot* platform instead, which is a different thing. The same selection can be written by hand as a list under `platform_toolsets` in `config.yaml`.
 
 ## Tests
 
