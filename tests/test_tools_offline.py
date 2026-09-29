@@ -511,7 +511,9 @@ def test_summary_only_folder_read_never_fetches_messages():
     """
     tools = _tools()
     with isolated_state():
-        dialogs = [_FakeDialog(), _FakeDialog()]
+        # More chats than the message-oriented default of 30: the summary-only form
+        # has to report the folder, not the first 30 of it.
+        dialogs = [_FakeDialog() for _ in range(41)]
         originals = {
             name: getattr(tools, name)
             for name in ("tool_client", "_select_dialogs", "_read_messages", "dialog_summary")
@@ -543,5 +545,5 @@ def test_summary_only_folder_read_never_fetches_messages():
             for name, value in originals.items():
                 setattr(tools, name, value)
 
-    assert len(payload["chats"]) == 2, "every chat in the folder is reported, messages or not"
+    assert len(payload["chats"]) == 41, "the whole folder, not the first 30 of it"
     assert all(chat["messages"] == [] for chat in payload["chats"])

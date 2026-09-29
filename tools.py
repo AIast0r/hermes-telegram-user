@@ -575,11 +575,15 @@ async def _tg_read_folder(args: dict[str, Any], **_: Any) -> str:
         since = parse_dt(args.get("since") or "today")
         until = parse_dt(args.get("until"))
         unread_only = bool(args.get("unread_only", False))
-        chat_limit = bounded_int(args.get("chat_limit"), 30, 1, 100)
         # 0 means "the folder's chat list, not its messages". The question this
         # answers is "what is in here", and the only way to answer it before was to
         # drag every chat's messages along — 41 chats, 299 KB, spilled to disk.
         per_chat = bounded_int(args.get("messages_per_chat"), 50, 0, 500)
+        # Summaries are a few hundred bytes each, so the message-oriented default of
+        # 30 would hand back 30 chats of a 41-chat folder and say nothing about the
+        # other 11 — a caller cannot tell that apart from a folder of 30. Messages
+        # are what need the ceiling; the size budget is the real limit here.
+        chat_limit = bounded_int(args.get("chat_limit"), 30 if per_chat else 100, 1, 100)
         digest = bool(args.get("since_last_digest", False))
         async with tool_client() as client:
             folder, dialogs = await _select_dialogs(client, folder_token)
